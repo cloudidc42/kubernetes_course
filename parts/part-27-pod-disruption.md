@@ -754,6 +754,280 @@ spec:
 
 ---
 
+## Workshop: PDB สำหรับ Critical Microservices
+
+เป้าหมาย: กำหนด PDB สำหรับ microservices หลายตัวอย่างครบถ้วน
+
+### 1. สร้าง Application Topology
+
+```yaml
+# microservices-pdb.yaml
+# PDB สำหรับ API Gateway (traffic entry point - critical!)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway-pdb
+  namespace: production
+  labels:
+    tier: critical
+    team: platform
+spec:
+  maxUnavailable: 0    # ← ห้าม unavailable เลย! (ถ้า replicas=2+ จะยอม 0)
+  selector:
+    matchLabels:
+      app: api-gateway
+      tier: critical
+---
+# PDB สำหรับ Auth Service
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: auth-service-pdb
+  namespace: production
+spec:
+  minAvailable: 2      # ต้องมีอย่างน้อย 2 replicas
+  selector:
+    matchLabels:
+      app: auth-service
+---
+# PDB สำหรับ Payment Service (critical!)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service-pdb
+  namespace: production
+  annotations:
+    note: "Payment service PDB - NEVER bring below 2 replicas"
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: payment-service
+---
+# PDB สำหรับ Worker Service (less critical)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-pdb
+  namespace: production
+spec:
+  maxUnavailable: "30%"    # 30% ลดได้
+  selector:
+    matchLabels:
+      app: worker
+---
+# PDB สำหรับ Cache Service
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cache-pdb
+  namespace: production
+spec:
+  minAvailable: "50%"   # ต้องมีอย่างน้อย 50%
+  selector:
+    matchLabels:
+      app: redis-cluster
+```
+
+### 2. Deployments ที่ตรงกับ PDB
+
+```yaml
+# microservices-deployments.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: production
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: api-gateway
+      tier: critical
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        tier: critical
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: [api-gateway]
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: api-gateway
+        image: nginx:1.21
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "128Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          periodSeconds: 5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+    spec:
+      containers:
+      - name: auth
+        image: auth-service:latest
+        resources:
+          requests:
+            cpu: "300m"
+            memory: "256Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      # กระจายไปคนละ zone
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: payment-service
+      containers:
+      - name: payment
+        image: payment-service:latest
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+```
+
+### 3. Script ตรวจสอบ PDB ก่อน Node Maintenance
+
+```bash
+#!/bin/bash
+# pre-drain-check.sh: ตรวจสอบ PDB ก่อน drain node
+
+NODE=${1:-$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')}
+
+echo "=== Pre-drain Check for Node: $NODE ==="
+echo ""
+
+# ดู pods บน node นี้
+echo "Pods on this node:"
+kubectl get pods -A --field-selector spec.nodeName=$NODE \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase'
+echo ""
+
+# ตรวจสอบ PDB ที่อาจ block
+echo "Checking PDBs that might block drain..."
+kubectl get pdb -A -o custom-columns=\
+'NAMESPACE:.metadata.namespace,NAME:.metadata.name,MIN_AVAIL:.spec.minAvailable,MAX_UNAVAIL:.spec.maxUnavailable,DISRUPTIONS:.status.disruptionsAllowed'
+echo ""
+
+# PDB ที่มี 0 disruptions allowed
+echo "PDBs with 0 disruptions allowed (WILL BLOCK drain):"
+kubectl get pdb -A -o json | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+blocked = False
+for item in data.get('items', []):
+    name = item['metadata']['name']
+    ns = item['metadata']['namespace']
+    allowed = item.get('status', {}).get('disruptionsAllowed', 0)
+    if allowed == 0:
+        print(f'  ⚠️  {ns}/{name}: 0 disruptions allowed - DRAIN MAY BE BLOCKED')
+        blocked = True
+if not blocked:
+    print('  ✓ No PDBs are blocking disruptions')
+"
+echo ""
+
+# Dry-run drain
+echo "Dry-run drain result:"
+kubectl drain $NODE \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --dry-run=client 2>&1 | head -30
+```
+
+### 4. ทดสอบ Cluster Upgrade Scenario
+
+```bash
+# Simulate cluster upgrade workflow
+
+# 1. ตรวจสอบ PDB ทั้งหมด
+kubectl get pdb -A
+
+# 2. ดู nodes
+kubectl get nodes
+
+# 3. Cordon master node
+kubectl cordon k8s-master-1
+
+# 4. Drain worker nodes ทีละ node
+for NODE in $(kubectl get nodes -l node-role.kubernetes.io/worker= -o jsonpath='{.items[*].metadata.name}'); do
+  echo "=== Draining $NODE ==="
+  
+  # ตรวจสอบก่อน
+  kubectl get pdb -A -o json | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for item in data['items']:
+    if item['status']['disruptionsAllowed'] == 0:
+        print(f\"WARNING: {item['metadata']['namespace']}/{item['metadata']['name']} blocks drain!\")
+"
+  
+  # Drain
+  kubectl drain $NODE \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --timeout=300s
+  
+  # ทำ upgrade operations ที่ node
+  echo "Upgrading $NODE..."
+  # ssh $NODE "sudo kubeadm upgrade node && sudo apt-get install -y kubelet kubeadm"
+  
+  # Uncordon
+  kubectl uncordon $NODE
+  
+  echo "=== $NODE upgraded ==="
+  sleep 30  # รอ pod schedule ใหม่ก่อน drain node ถัดไป
+done
+```
+
+---
+
 ## สรุป
 
 Pod Disruption Budget เป็นเครื่องมือสำคัญสำหรับ:
@@ -763,11 +1037,32 @@ Pod Disruption Budget เป็นเครื่องมือสำคัญ�
 3. **Scaling Operations**: ลด nodes ด้วย cluster autoscaler
 4. **High Availability**: รับประกัน minimum replicas ตลอดเวลา
 
+### Quick Reference
+
+```bash
+# สร้าง PDB อย่างรวดเร็ว
+kubectl create poddisruptionbudget my-pdb \
+  --selector=app=my-app \
+  --min-available=2 \
+  -n production
+
+# ดู PDB status summary
+kubectl get pdb -A -o custom-columns=\
+'NS:.metadata.namespace,NAME:.metadata.name,MIN:.spec.minAvailable,MAX:.spec.maxUnavailable,ALLOWED:.status.disruptionsAllowed,CURRENT:.status.currentHealthy,DESIRED:.status.desiredHealthy'
+
+# ดู PDB YAML
+kubectl get pdb my-pdb -n production -o yaml
+
+# ลบ PDB
+kubectl delete pdb my-pdb -n production
+```
+
 ข้อสำคัญ:
 - PDB ปกป้องเฉพาะ **voluntary disruptions**
 - ใช้ minAvailable สำหรับ absolute minimum
 - ใช้ maxUnavailable สำหรับ maximum disruptions
 - Percentage เหมาะกับ large deployments
 - ต้องมี replicas ≥ 2 จึงจะ PDB มีความหมาย
+- **ทดสอบ PDB** ด้วย dry-run drain ก่อน maintenance จริง
 
 ในบทต่อไป เราจะเรียนรู้เรื่อง **Init Containers** - containers พิเศษที่รันก่อน main container
