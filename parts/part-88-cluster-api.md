@@ -847,6 +847,191 @@ kubectl logs -n capi-kubeadm-control-plane-system deploy/capi-kubeadm-control-pl
 
 ---
 
+## 88.9 CAPI Troubleshooting
+
+### Cluster ไม่ขึ้น (Provisioning Stuck)
+
+```bash
+# ดู phase ของ Cluster
+kubectl get cluster my-cluster -o jsonpath='{.status.phase}'
+
+# ตรวจสอบ conditions
+kubectl get cluster my-cluster -o jsonpath='{.status.conditions}' | python3 -m json.tool
+
+# ดู Machine status
+kubectl get machines -o wide
+# NAME                                   CLUSTER      NODENAME   PROVIDERID   PHASE
+# my-cluster-control-plane-xxxxx         my-cluster              docker://xx  Provisioning
+
+# Debug individual Machine
+kubectl describe machine my-cluster-control-plane-xxxxx
+
+# ดู bootstrap data
+kubectl get kubeadmconfig -n default
+
+# ดู infrastructure resource
+kubectl get dockermachine my-cluster-control-plane-xxxxx -o yaml | grep -A 10 status
+```
+
+### Node ไม่ Join Cluster
+
+```bash
+# ตรวจสอบ bootstrap token
+kubectl exec -n capi-system deploy/capi-controller-manager \
+  -- cat /var/log/capi.log | grep -i "bootstrap"
+
+# ดู kubeadm join command
+kubectl get secret my-cluster-kubeconfig -o jsonpath='{.data.value}' | base64 -d > /tmp/workload.kubeconfig
+
+# SSH เข้า machine (Docker provider)
+docker exec -it <container-name> bash
+journalctl -u kubelet -n 50
+
+# Check control plane endpoint
+kubectl get cluster my-cluster -o jsonpath='{.spec.controlPlaneEndpoint}'
+```
+
+### Remediation (Auto-repair)
+
+```yaml
+# MachineHealthCheck: auto-replace unhealthy nodes
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: my-cluster-worker-unhealthy
+  namespace: default
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: my-cluster-md-0
+  unhealthyConditions:
+    - type: Ready
+      status: Unknown
+      timeout: 300s
+    - type: Ready
+      status: "False"
+      timeout: 300s
+  maxUnhealthy: "40%"
+  nodeStartupTimeout: 10m
+```
+
+---
+
+## 88.10 Advanced CAPI Patterns
+
+### Multi-Tenancy ด้วย Namespace Isolation
+
+```bash
+# สร้าง namespace สำหรับแต่ละ team
+kubectl create namespace team-alpha
+kubectl create namespace team-beta
+
+# Deploy cluster ใน namespace ของ team
+kubectl apply -f team-alpha-cluster.yaml -n team-alpha
+
+# RBAC: ให้ team-alpha manage เฉพาะ clusters ของตัวเอง
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: capi-cluster-admin
+  namespace: team-alpha
+rules:
+  - apiGroups: ["cluster.x-k8s.io", "infrastructure.cluster.x-k8s.io",
+                "bootstrap.cluster.x-k8s.io", "controlplane.cluster.x-k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: team-alpha-cluster-admin
+  namespace: team-alpha
+subjects:
+  - kind: Group
+    name: team-alpha
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: capi-cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+EOF
+```
+
+### GitOps ด้วย Flux + CAPI
+
+```yaml
+# flux-system/clusters/my-cluster.yaml
+# ใช้ Flux GitOps เพื่อ manage CAPI clusters
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: capi-clusters
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://github.com/myorg/capi-clusters
+  ref:
+    branch: main
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: capi-clusters
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./clusters
+  prune: true  # ลบ cluster ถ้า Git ลบ file
+  sourceRef:
+    kind: GitRepository
+    name: capi-clusters
+  healthChecks:
+    - apiVersion: cluster.x-k8s.io/v1beta1
+      kind: Cluster
+      name: production
+      namespace: default
+```
+
+### Cluster Addon Management ด้วย ClusterResourceSet
+
+```yaml
+# ติดตั้ง CNI โดยอัตโนมัติเมื่อ cluster ถูกสร้าง
+apiVersion: addons.cluster.x-k8s.io/v1beta1
+kind: ClusterResourceSet
+metadata:
+  name: calico-cni
+  namespace: default
+spec:
+  clusterSelector:
+    matchLabels:
+      cni: calico
+  resources:
+    - name: calico-configmap
+      kind: ConfigMap
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: calico-configmap
+  namespace: default
+data:
+  calico.yaml: |
+    apiVersion: operator.tigera.io/v1
+    kind: Installation
+    metadata:
+      name: default
+    spec:
+      calicoNetwork:
+        ipPools:
+          - blockSize: 26
+            cidr: 192.168.0.0/16
+            encapsulation: VXLANCrossSubnet
+```
+
+---
+
 ## สรุป
 
 ในบทนี้เราได้เรียนรู้:
@@ -859,5 +1044,7 @@ kubectl logs -n capi-kubeadm-control-plane-system deploy/capi-kubeadm-control-pl
 6. **ClusterClass**: Reusable cluster templates
 7. **Workshop**: สร้าง, อัปเกรด, และ scale cluster
 8. **Monitoring**: ตรวจสอบ cluster status
+9. **Troubleshooting**: แก้ปัญหา cluster provisioning
+10. **Advanced Patterns**: Multi-tenancy, GitOps, Addon Management
 
 บทถัดไปเราจะเรียนรู้เกี่ยวกับ Amazon EKS
