@@ -647,17 +647,277 @@ kubectl get pods --all-namespaces \
 
 ## สรุป
 
+### Lab 6: Query Pods ด้วย Annotations (Advanced)
+
+```bash
+# สร้าง Pods พร้อม Annotations ต่างๆ
+kubectl create namespace annotation-query
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: monitored-pod
+  namespace: annotation-query
+  labels:
+    app: monitored
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    team: "frontend"
+    priority: "high"
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unmonitored-pod
+  namespace: annotation-query
+  labels:
+    app: unmonitored
+  annotations:
+    prometheus.io/scrape: "false"
+    team: "backend"
+    priority: "low"
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: critical-pod
+  namespace: annotation-query
+  labels:
+    app: critical
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    team: "platform"
+    priority: "critical"
+    pagerduty-key: "PD-SERVICE-123"
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+EOF
+
+kubectl wait --for=condition=Ready pods --all \
+    -n annotation-query --timeout=120s
+
+# ค้นหา Pods ที่ Prometheus จะ scrape
+kubectl get pods -n annotation-query \
+    -o jsonpath='{range .items[?(@.metadata.annotations.prometheus\.io/scrape=="true")]}{.metadata.name}{"\n"}{end}'
+
+# แสดง annotation ทุก Pods
+kubectl get pods -n annotation-query \
+    -o custom-columns='NAME:.metadata.name,SCRAPE:.metadata.annotations.prometheus\.io/scrape,TEAM:.metadata.annotations.team,PRIORITY:.metadata.annotations.priority'
+
+# ดู annotation เฉพาะ pod
+kubectl get pod critical-pod -n annotation-query \
+    -o jsonpath='{.metadata.annotations}' | python3 -m json.tool
+
+# Cleanup
+kubectl delete namespace annotation-query
+```
+
+### Lab 7: Annotation-driven Automation Script
+
+```bash
+# สถานการณ์: Script อัตโนมัติที่อ่าน Annotations เพื่อทำงาน
+
+# สร้าง Deployment ที่มี annotation สำหรับ auto-scaling policy
+cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auto-policy-app
+  namespace: annotation-workshop
+  annotations:
+    autoscaling.policy/min-replicas: "2"
+    autoscaling.policy/max-replicas: "10"
+    autoscaling.policy/cpu-threshold: "70"
+    backup.policy/enabled: "true"
+    backup.policy/schedule: "0 2 * * *"
+    backup.policy/retention-days: "30"
+    monitoring.policy/enabled: "true"
+    monitoring.policy/alert-slack: "#ops-alerts"
+    monitoring.policy/on-call: "ops-team"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auto-policy-app
+  template:
+    metadata:
+      labels:
+        app: auto-policy-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+EOF
+
+# Script ที่อ่าน Annotations แล้วตัดสินใจ
+cat <<'SCRIPT' > /tmp/policy-enforcer.sh
+#!/bin/bash
+# อ่าน autoscaling policy จาก annotations
+
+NAMESPACE="${1:-annotation-workshop}"
+DEPLOYMENT="${2:-auto-policy-app}"
+
+echo "=== Policy Enforcer ==="
+echo "Reading policies from: $DEPLOYMENT/$NAMESPACE"
+echo ""
+
+# อ่าน autoscaling policy
+MIN_REPLICAS=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.metadata.annotations.autoscaling\.policy/min-replicas}')
+MAX_REPLICAS=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.metadata.annotations.autoscaling\.policy/max-replicas}')
+CPU_THRESHOLD=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.metadata.annotations.autoscaling\.policy/cpu-threshold}')
+CURRENT_REPLICAS=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.spec.replicas}')
+
+echo "Auto-scaling Policy:"
+echo "  Min Replicas: ${MIN_REPLICAS:-not set}"
+echo "  Max Replicas: ${MAX_REPLICAS:-not set}"
+echo "  CPU Threshold: ${CPU_THRESHOLD:-not set}%"
+echo "  Current Replicas: $CURRENT_REPLICAS"
+echo ""
+
+# Validate policy
+if [ -n "$MIN_REPLICAS" ] && [ "$CURRENT_REPLICAS" -lt "$MIN_REPLICAS" ]; then
+    echo "WARNING: Current replicas ($CURRENT_REPLICAS) below minimum ($MIN_REPLICAS)"
+    echo "Action: Scaling up to minimum..."
+    kubectl scale deployment $DEPLOYMENT -n $NAMESPACE --replicas=$MIN_REPLICAS
+fi
+
+# อ่าน backup policy
+BACKUP_ENABLED=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.metadata.annotations.backup\.policy/enabled}')
+BACKUP_SCHEDULE=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.metadata.annotations.backup\.policy/schedule}')
+
+echo "Backup Policy:"
+echo "  Enabled: ${BACKUP_ENABLED:-false}"
+echo "  Schedule: ${BACKUP_SCHEDULE:-not set}"
+echo ""
+
+# อ่าน monitoring policy
+MONITORING_ENABLED=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.metadata.annotations.monitoring\.policy/enabled}')
+ALERT_SLACK=$(kubectl get deployment $DEPLOYMENT -n $NAMESPACE \
+    -o jsonpath='{.metadata.annotations.monitoring\.policy/alert-slack}')
+
+echo "Monitoring Policy:"
+echo "  Enabled: ${MONITORING_ENABLED:-false}"
+echo "  Alert Slack: ${ALERT_SLACK:-not set}"
+SCRIPT
+
+chmod +x /tmp/policy-enforcer.sh
+/tmp/policy-enforcer.sh annotation-workshop auto-policy-app
+
+# Cleanup
+kubectl delete deployment auto-policy-app -n annotation-workshop
+rm -f /tmp/policy-enforcer.sh
+```
+
+### คำสั่ง Annotation ที่ใช้บ่อย
+
+```bash
+# เพิ่ม Annotation
+kubectl annotate pod my-pod key=value
+kubectl annotate deployment my-deploy key=value
+kubectl annotate node my-node key=value
+
+# เพิ่มหลาย Annotations
+kubectl annotate pod my-pod \
+    key1=value1 \
+    key2=value2 \
+    key3=value3
+
+# แก้ไข Annotation (ต้องใช้ --overwrite)
+kubectl annotate pod my-pod key=newvalue --overwrite
+
+# ลบ Annotation (ต่อท้ายด้วย -)
+kubectl annotate pod my-pod key-
+
+# ดู Annotations
+kubectl describe pod my-pod | grep -A 20 "Annotations:"
+kubectl get pod my-pod -o jsonpath='{.metadata.annotations}'
+
+# ดู Annotation เฉพาะ (ต้อง escape dots ด้วย \.)
+kubectl get pod my-pod \
+    -o jsonpath='{.metadata.annotations.kubernetes\.io/change-cause}'
+
+# แสดง Annotation เป็น column
+kubectl get pods \
+    -o custom-columns='NAME:.metadata.name,CHANGE-CAUSE:.metadata.annotations.kubernetes\.io/change-cause'
+
+# ค้นหา Resources ที่มี Annotation เฉพาะ
+kubectl get pods -A \
+    -o jsonpath='{range .items[?(@.metadata.annotations.prometheus\.io/scrape=="true")]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}'
+```
+
+### Annotations Standard ที่ Kubernetes ใช้
+
+```bash
+# Annotations ที่ Kubernetes เองใช้:
+
+# 1. kubectl.kubernetes.io/last-applied-configuration
+# เก็บ manifest ล่าสุดที่ apply ด้วย kubectl apply
+kubectl get pod my-pod \
+    -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}'
+
+# 2. kubernetes.io/change-cause
+# เก็บ reason ของ Deployment rollout
+kubectl annotate deployment my-deploy \
+    kubernetes.io/change-cause="Fix critical bug CVE-2024-001"
+
+# 3. deployment.kubernetes.io/revision
+# เก็บ revision number ของ Deployment (auto-managed)
+kubectl get deployment my-deploy \
+    -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}'
+
+# 4. autoscaling.alpha.kubernetes.io/
+# ใช้โดย HPA
+
+# 5. cluster-autoscaler.kubernetes.io/
+# ใช้โดย Cluster Autoscaler
+kubectl annotate node my-node \
+    cluster-autoscaler.kubernetes.io/scale-down-disabled="true"
+```
+
+---
+
+## สรุป
+
 Annotations เป็นส่วนสำคัญของ Kubernetes metadata system:
 
 1. **ไม่ใช้ select**: ต่างจาก Labels ตรงที่ไม่ใช้ filter Resources
 2. **เก็บข้อมูลเพิ่มเติม**: build info, deployment info, documentation
 3. **Tool Integration**: Ingress controllers, Prometheus, Service Mesh ใช้ Annotations สำหรับ configuration
 4. **Human Readable**: เก็บข้อมูลสำหรับ operators อ่านและ reference
+5. **Automation**: Scripts และ tools อ่าน Annotations เพื่อตัดสินใจอัตโนมัติ
 
 **Best Practices:**
-- ใช้ prefix สำหรับ organization-specific annotations
+- ใช้ prefix สำหรับ organization-specific annotations (mycompany.io/key)
 - เก็บ build/deployment info ทุกครั้ง
-- อย่าเก็บ secrets ใน Annotations
-- ใช้ JSON/YAML สำหรับ structured data
+- อย่าเก็บ secrets ใน Annotations (ใช้ Secrets object แทน)
+- ใช้ JSON/YAML สำหรับ structured data ที่ซับซ้อน
+- Document ว่า annotation แต่ละตัวหมายความว่าอะไร
 
 ในบทต่อไปเราจะเรียนรู้ **ConfigMaps** ซึ่งใช้เก็บ configuration data สำหรับ Applications
