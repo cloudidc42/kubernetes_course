@@ -677,6 +677,309 @@ kubectl delete rs nginx-rs --cascade=orphan
 
 ---
 
+### Lab 8: ReplicaSet Debugging
+
+```bash
+# สร้าง namespace ใหม่สำหรับ debug lab
+kubectl create namespace rs-debug
+
+# สร้าง ReplicaSet ที่มีปัญหา (image ไม่มีอยู่)
+cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: broken-rs
+  namespace: rs-debug
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: broken
+  template:
+    metadata:
+      labels:
+        app: broken
+    spec:
+      containers:
+      - name: broken-app
+        image: nginx:this-tag-does-not-exist
+        ports:
+        - containerPort: 80
+EOF
+
+# ดูสถานะ ReplicaSet
+kubectl get rs broken-rs -n rs-debug
+# DESIRED: 3, CURRENT: 3, READY: 0
+
+# ดูสถานะ Pods
+kubectl get pods -n rs-debug
+# จะเห็น ImagePullBackOff หรือ ErrImagePull
+
+# Debug ด้วย describe
+kubectl describe rs broken-rs -n rs-debug
+kubectl describe pods -n rs-debug | grep -A 5 "Events:"
+
+# แก้ไข image ที่ถูกต้อง
+kubectl patch rs broken-rs -n rs-debug \
+    -p '{"spec":{"template":{"spec":{"containers":[{"name":"broken-app","image":"nginx:latest"}]}}}}'
+
+# ลบ Pods เก่าที่ใช้ image ผิด (RS จะสร้างใหม่ด้วย image ที่ถูก)
+kubectl delete pods -n rs-debug --all
+kubectl get pods -n rs-debug --watch &
+WATCH_PID=$!
+sleep 20
+kill $WATCH_PID 2>/dev/null
+
+# ตรวจสอบ
+kubectl get rs broken-rs -n rs-debug
+# DESIRED: 3, CURRENT: 3, READY: 3
+
+# Cleanup
+kubectl delete namespace rs-debug
+```
+
+### Lab 9: ReplicaSet Ownership
+
+```bash
+# ทำความเข้าใจ ownerReferences
+
+# สร้าง ReplicaSet
+cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: ownership-rs
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ownership-demo
+  template:
+    metadata:
+      labels:
+        app: ownership-demo
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+EOF
+
+# รอ Pods พร้อม
+kubectl wait --for=condition=Ready pods -l app=ownership-demo --timeout=60s
+
+# ดู ownerReferences ของ Pod
+POD_NAME=$(kubectl get pods -l app=ownership-demo -o jsonpath='{.items[0].metadata.name}')
+kubectl get pod $POD_NAME -o jsonpath='{.metadata.ownerReferences}' | python3 -m json.tool
+
+# Output จะแสดง:
+# [
+#   {
+#     "apiVersion": "apps/v1",
+#     "blockOwnerDeletion": true,
+#     "controller": true,
+#     "kind": "ReplicaSet",
+#     "name": "ownership-rs",
+#     "uid": "..."
+#   }
+# ]
+
+# ลบ ReplicaSet แต่เก็บ Pods (orphan)
+kubectl delete rs ownership-rs --cascade=orphan
+
+# Pods ยังอยู่ แต่ไม่มีเจ้าของแล้ว
+kubectl get pods -l app=ownership-demo
+kubectl get pod $POD_NAME -o jsonpath='{.metadata.ownerReferences}'
+# Empty! Pods กลายเป็น orphan
+
+# Cleanup
+kubectl delete pods -l app=ownership-demo
+```
+
+### Lab 10: ReplicaSet กับ Pod Disruption Budget
+
+```bash
+# PodDisruptionBudget (PDB) ป้องกัน disruption มากเกินไป
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: stable-rs
+  namespace: default
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: stable-app
+  template:
+    metadata:
+      labels:
+        app: stable-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+---
+# PDB: รับประกันว่าจะมีอย่างน้อย 3 Pods พร้อมเสมอ
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: stable-pdb
+  namespace: default
+spec:
+  minAvailable: 3        # อย่างน้อย 3 Pods ต้อง available
+  selector:
+    matchLabels:
+      app: stable-app
+EOF
+
+# ดู PDB
+kubectl get pdb stable-pdb
+kubectl describe pdb stable-pdb
+
+# Output:
+# Min available: 3
+# Current healthy: 5
+# Desired healthy: 3
+# Total replicas: 5
+# Disruptions allowed: 2
+
+# ลบทุกอย่าง
+kubectl delete rs stable-rs
+kubectl delete pdb stable-pdb
+```
+
+### คำสั่ง ReplicaSet ที่ใช้บ่อย
+
+```bash
+# ดู ReplicaSets
+kubectl get replicasets
+kubectl get rs -A                              # ทุก namespaces
+kubectl get rs -n my-namespace                 # เฉพาะ namespace
+kubectl get rs -l app=nginx                    # filter ด้วย label
+
+# รายละเอียด
+kubectl describe rs my-rs
+kubectl describe rs -l app=nginx               # ทุก RS ที่มี label
+
+# Scale
+kubectl scale rs my-rs --replicas=5
+kubectl scale rs my-rs --replicas=0            # ลบ Pods ชั่วคราว
+
+# YAML
+kubectl get rs my-rs -o yaml                   # ดู YAML
+kubectl edit rs my-rs                          # แก้ไข live
+
+# ลบ
+kubectl delete rs my-rs                        # ลบ RS + Pods
+kubectl delete rs my-rs --cascade=orphan       # ลบ RS เก็บ Pods
+kubectl delete rs -l app=nginx                 # ลบตาม label
+
+# ดู Pods ที่ managed
+kubectl get pods -l app=nginx                  # ดู Pods
+kubectl get pods -o wide -l app=nginx          # ดู Pods พร้อม Node info
+
+# ตรวจสอบ ownership
+kubectl get pod <pod-name> -o jsonpath='{.metadata.ownerReferences[0].name}'
+```
+
+### ตัวอย่าง ReplicaSet ใน Real World
+
+```yaml
+# production-replicaset.yaml
+# ตัวอย่าง ReplicaSet สำหรับ Production
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: api-server-rs
+  namespace: production
+  labels:
+    app: api-server
+    tier: backend
+    env: production
+  annotations:
+    description: "ReplicaSet for API server - managed by Deployment"
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api-server
+      tier: backend
+  template:
+    metadata:
+      labels:
+        app: api-server
+        tier: backend
+        version: "3.2.1"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      terminationGracePeriodSeconds: 60
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: api-server
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: api-server
+        image: mycompany/api-server:3.2.1
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: APP_ENV
+          value: "production"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 15"]
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+```
+
+---
+
 ## สรุป
 
 ReplicaSet เป็น Controller สำคัญใน Kubernetes ที่:
@@ -685,6 +988,7 @@ ReplicaSet เป็น Controller สำคัญใน Kubernetes ที่:
 2. **Self-healing**: สร้าง Pod ใหม่โดยอัตโนมัติเมื่อ Pod ล้มเหลว
 3. **Label-based Selection**: ใช้ labels เพื่อ identify Pods ที่จัดการ
 4. **Flexible Selectors**: รองรับทั้ง equality-based และ set-based selectors
+5. **Ownership**: Pod รู้ว่าใครเป็นเจ้าของผ่าน ownerReferences
 
 **คำแนะนำ**: ในทางปฏิบัติ ให้ใช้ **Deployment** แทน ReplicaSet โดยตรง เพราะ:
 - Deployment จัดการ ReplicaSet ให้อัตโนมัติ

@@ -818,6 +818,294 @@ Crossplane:
 
 ---
 
+## 87.10 Federation Monitoring และ Troubleshooting
+
+### ตรวจสอบ KubeFed Status
+
+```bash
+# ดู controller logs
+kubectl logs -n kube-federation-system \
+  -l control-plane=controller-manager \
+  --tail=100 -f
+
+# ดู status ของ federated resources
+kubectl get federateddeployment -n production -o yaml | grep -A 30 status:
+
+# ดู events
+kubectl get events -n kube-federation-system --sort-by='.lastTimestamp'
+
+# ตรวจสอบ cluster connectivity
+for cluster in east west eu; do
+  echo "Checking ${cluster}..."
+  kubectl get kubefedcluster ${cluster} -n kube-federation-system \
+    -o jsonpath='{.status.conditions[0]}'
+  echo ""
+done
+
+# Test API endpoint
+kubefedctl check api --host-cluster-context=kind-host
+```
+
+### Debug Placement Issues
+
+```bash
+# ถ้า resource ไม่ถูก propagate ไปยัง cluster
+kubectl describe federateddeployment my-app -n production
+
+# ดู placement decisions
+kubectl get federateddeployment my-app -n production \
+  -o jsonpath='{.status.placement}' | python3 -m json.tool
+
+# Force reconciliation
+kubectl annotate federateddeployment my-app -n production \
+  federation.alpha.kubernetes.io/force-reconcile=$(date +%s) \
+  --overwrite
+
+# ดู propagation status
+kubectl get federateddeployment my-app -n production \
+  -o jsonpath='{.status.clusters}'
+```
+
+### Common KubeFed Problems
+
+```bash
+# Problem 1: Cluster ไม่เชื่อมต่อ
+# Solution: ตรวจสอบ kubeconfig secret
+kubectl get secret -n kube-federation-system \
+  -l kubefed.io/cluster=east
+
+# ตรวจสอบ API server reachability
+kubectl exec -n kube-federation-system \
+  deploy/kubefed-controller-manager \
+  -- curl -k https://east-cluster-api:6443/healthz
+
+# Problem 2: Resources ไม่ sync
+# Solution: ตรวจสอบ FederatedTypeConfig
+kubectl get federatedtypeconfigs -n kube-federation-system
+kubectl describe federatedtypeconfig deployments.apps -n kube-federation-system
+
+# Problem 3: Override ไม่ทำงาน
+# Solution: ตรวจสอบ syntax ของ override
+kubectl apply --dry-run=server -f federated-deployment.yaml
+```
+
+---
+
+## 87.11 Advanced Federation Patterns
+
+### Multi-region Active-Active Database Pattern
+
+```yaml
+# federated-database-config.yaml
+apiVersion: types.kubefed.io/v1beta1
+kind: FederatedConfigMap
+metadata:
+  name: db-connection-config
+  namespace: production
+spec:
+  template:
+    data:
+      config.yaml: |
+        database:
+          primary: db-primary.production.svc.cluster.local
+          replicas:
+            - db-replica-1.production.svc.cluster.local
+            - db-replica-2.production.svc.cluster.local
+  placement:
+    clusters:
+      - name: east
+      - name: west
+      - name: eu
+  overrides:
+    # East cluster ใช้ RDS instance ของ us-east
+    - clusterName: east
+      clusterOverrides:
+        - path: "/data/config.yaml"
+          value: |
+            database:
+              primary: mydb.us-east-1.rds.amazonaws.com
+              replicas:
+                - mydb-ro.us-east-1.rds.amazonaws.com
+    # EU cluster ต้องใช้ EU database เพื่อ GDPR compliance
+    - clusterName: eu
+      clusterOverrides:
+        - path: "/data/config.yaml"
+          value: |
+            database:
+              primary: mydb.eu-central-1.rds.amazonaws.com
+              replicas:
+                - mydb-ro.eu-central-1.rds.amazonaws.com
+            gdpr:
+              enabled: true
+              dataResidency: EU
+```
+
+### Blue-Green Deployment ข้าม Clusters
+
+```bash
+# Strategy: deploy เวอร์ชัน ใหม่ใน "green" clusters
+# ก่อน switch traffic ไปยัง green clusters
+
+# 1. Deploy เวอร์ชันใหม่ใน West cluster ก่อน (green)
+kubectl patch federateddeployment my-app -n production \
+  --type='json' \
+  -p='[
+    {"op": "replace", "path": "/spec/placement/clusters", 
+     "value": [{"name": "west"}]},
+    {"op": "replace", 
+     "path": "/spec/template/spec/template/spec/containers/0/image",
+     "value": "myapp:2.0.0"}
+  ]'
+
+# ทดสอบ West cluster
+kubectl get deployment my-app -n production --context=kind-west
+kubectl rollout status deployment/my-app -n production --context=kind-west
+
+# 2. ถ้า West ดี ขยายไปทุก clusters
+kubectl patch federateddeployment my-app -n production \
+  --type='json' \
+  -p='[{"op": "replace", "path": "/spec/placement/clusters",
+        "value": [{"name": "east"}, {"name": "west"}, {"name": "eu"}]}]'
+
+# ดู rollout ทุก clusters
+for cluster in east west eu; do
+  echo "=== ${cluster} ==="
+  kubectl rollout status deployment/my-app -n production \
+    --context=kind-${cluster}
+done
+```
+
+### Federation with Service Mesh
+
+```yaml
+# Federated VirtualService (Istio)
+# ต้องสร้าง FederatedTypeConfig สำหรับ Istio types ก่อน
+apiVersion: types.kubefed.io/v1beta1
+kind: FederatedVirtualService
+metadata:
+  name: my-app-vs
+  namespace: production
+spec:
+  template:
+    spec:
+      hosts:
+        - my-app
+      http:
+        - match:
+            - headers:
+                x-canary:
+                  exact: "true"
+          route:
+            - destination:
+                host: my-app
+                subset: v2
+              weight: 100
+        - route:
+            - destination:
+                host: my-app
+                subset: v1
+              weight: 100
+  placement:
+    clusters:
+      - name: east
+      - name: west
+  overrides:
+    # Progressive rollout: 10% ใน West
+    - clusterName: west
+      clusterOverrides:
+        - path: "/spec/http/1/route"
+          value:
+            - destination:
+                host: my-app
+                subset: v1
+              weight: 90
+            - destination:
+                host: my-app
+                subset: v2
+              weight: 10
+```
+
+---
+
+## 87.12 Federation Best Practices
+
+### 1. Namespace-scoped Federation
+
+```yaml
+# ใช้ namespace-scoped federation แทน cluster-scoped
+# เพื่อ better isolation
+
+# สร้าง federation ใน specific namespace
+apiVersion: types.kubefed.io/v1beta1
+kind: FederatedNamespace
+metadata:
+  name: production
+  namespace: production  # self-reference
+spec:
+  placement:
+    clusters:
+      - name: east
+      - name: west
+```
+
+### 2. Label-based Placement
+
+```bash
+# ตั้ง labels บน clusters เพื่อ dynamic placement
+kubectl label kubefedcluster east \
+  region=americas \
+  tier=production \
+  compliance=pci-dss \
+  -n kube-federation-system
+
+kubectl label kubefedcluster eu \
+  region=europe \
+  tier=production \
+  compliance=gdpr \
+  -n kube-federation-system
+
+# Deploy เฉพาะ clusters ที่ compliant ด้วย GDPR
+apiVersion: types.kubefed.io/v1beta1
+kind: FederatedDeployment
+metadata:
+  name: eu-service
+  namespace: production
+spec:
+  template: {}
+  placement:
+    clusterSelector:
+      matchLabels:
+        compliance: gdpr
+```
+
+### 3. Gradual Rollout
+
+```bash
+# Phase 1: Test ใน 1 cluster
+# Phase 2: Expand ไป dev/staging clusters
+# Phase 3: Production clusters ทีละ region
+# Phase 4: Full rollout
+
+# เริ่มจาก 1 cluster
+kubectl patch federateddeployment my-app \
+  --type=merge \
+  -p '{"spec":{"placement":{"clusters":[{"name":"west"}]}}}'
+
+# Verify แล้วขยาย
+sleep 300  # รอ 5 นาที
+kubectl patch federateddeployment my-app \
+  --type=merge \
+  -p '{"spec":{"placement":{"clusters":[{"name":"west"},{"name":"east"}]}}}'
+
+# Complete rollout
+sleep 300
+kubectl patch federateddeployment my-app \
+  --type=merge \
+  -p '{"spec":{"placement":{"clusters":[{"name":"west"},{"name":"east"},{"name":"eu"}]}}}'
+```
+
+---
+
 ## สรุป
 
 ในบทนี้เราได้เรียนรู้:
@@ -828,6 +1116,9 @@ Crossplane:
 4. **Placement Policies**: clusterSelector, labels
 5. **ReplicaSchedulingPreference**: กระจาย replicas ตาม weight
 6. **Workshop**: E-commerce app deployment ไปหลาย clusters
-7. **Alternatives**: เปรียบเทียบกับ Argo CD, Fleet, Crossplane
+7. **Monitoring & Troubleshooting**: ตรวจสอบและแก้ไขปัญหา
+8. **Advanced Patterns**: Blue-Green, Service Mesh integration
+9. **Best Practices**: Namespace-scoped, Label-based placement, Gradual rollout
+10. **Alternatives**: เปรียบเทียบกับ Argo CD, Fleet, Crossplane
 
 บทถัดไปเราจะเรียนรู้เกี่ยวกับ Cluster API (CAPI)
