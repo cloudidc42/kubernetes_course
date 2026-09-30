@@ -944,6 +944,93 @@ spec:
 
 ---
 
+## 89.10 EKS Troubleshooting และ Best Practices
+
+### Node ไม่ Join Cluster
+
+```bash
+# ตรวจสอบ node group status
+aws eks describe-nodegroup \
+  --cluster-name production \
+  --nodegroup-name app-nodes \
+  --query 'nodegroup.health'
+
+# ดู EC2 instance logs
+aws ec2 get-console-output \
+  --instance-id i-0123456789 \
+  --latest
+
+# ตรวจสอบ IAM role สำหรับ nodes
+aws iam get-role --role-name eks-node-role
+aws iam list-attached-role-policies --role-name eks-node-role
+
+# ดู auth ConfigMap
+kubectl describe configmap aws-auth -n kube-system
+```
+
+### Pod ไม่สามารถ Access AWS Services
+
+```bash
+# ตรวจสอบ IRSA annotation
+kubectl describe sa my-service-account -n production | grep eks.amazonaws.com
+
+# ดู OIDC provider
+aws iam list-open-id-connect-providers
+aws eks describe-cluster --name production \
+  --query 'cluster.identity.oidc.issuer'
+
+# Test IAM permissions
+kubectl run aws-test --rm -it \
+  --image=amazon/aws-cli \
+  --serviceaccount=my-service-account \
+  --namespace=production \
+  -- aws sts get-caller-identity
+
+# ตรวจสอบ trust policy
+aws iam get-role --role-name my-app-role \
+  --query 'Role.AssumeRolePolicyDocument'
+```
+
+### EKS Upgrade Best Practices
+
+```bash
+# 1. ตรวจสอบ deprecated APIs ก่อน upgrade
+kubectl api-resources --verbs=list | grep -v "^NAME"
+
+# ใช้ Pluto tool ตรวจสอบ deprecated API
+helm install pluto fairwinds/pluto
+kubectl get all --all-namespaces -o yaml | pluto detect -
+
+# 2. อัปเกรด control plane ก่อน
+aws eks update-cluster-version \
+  --name production \
+  --kubernetes-version 1.30
+
+aws eks wait cluster-active --name production
+
+# 3. อัปเกรด addons
+aws eks update-addon \
+  --cluster-name production \
+  --addon-name vpc-cni \
+  --addon-version v1.18.0-eksbuild.1
+
+# 4. อัปเกรด node groups ทีละ group
+aws eks update-nodegroup-version \
+  --cluster-name production \
+  --nodegroup-name system-nodes \
+  --launch-template version=2
+
+aws eks wait nodegroup-active \
+  --cluster-name production \
+  --nodegroup-name system-nodes
+
+# 5. ตรวจสอบหลัง upgrade
+kubectl get nodes -o wide
+kubectl get pods --all-namespaces | grep -v Running
+```
+
+---
+
 ## สรุป
 
 ในบทนี้เราได้เรียนรู้:
@@ -957,5 +1044,6 @@ spec:
 7. **Cluster Autoscaler**: Auto-scale nodes
 8. **Workshop**: Production EKS setup แบบ end-to-end
 9. **Security**: Encryption, private endpoints, GuardDuty
+10. **Troubleshooting**: แก้ปัญหา node join, IRSA, และ cluster upgrade
 
 บทถัดไปเราจะเรียนรู้เกี่ยวกับ Google Kubernetes Engine (GKE)
