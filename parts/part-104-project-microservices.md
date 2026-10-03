@@ -984,3 +984,1918 @@ Microservices Architecture นี้ประกอบด้วย:
 - [Kafka on Kubernetes](https://kafka.apache.org/documentation/)
 - [Jaeger Tracing](https://www.jaegertracing.io/)
 - [Chaos Mesh](https://chaos-mesh.org/)
+
+---
+
+## Complete YAML Manifests - ทุก Microservice
+
+### Auth Service - YAML ครบ
+
+```yaml
+# auth-service.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: microservices
+  labels:
+    istio-injection: enabled
+---
+# Auth Service ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-service-config
+  namespace: microservices
+data:
+  APP_PORT: "8080"
+  LOG_LEVEL: "info"
+  JWT_EXPIRY: "3600"
+  REFRESH_TOKEN_EXPIRY: "604800"
+  REDIS_HOST: "redis.microservices.svc.cluster.local"
+  REDIS_PORT: "6379"
+---
+# Auth Service Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: microservices
+  labels:
+    app: auth-service
+    version: v1
+    tier: backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: auth-service
+      version: v1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: auth-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: auth-service-sa
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: auth-service
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: auth-service
+        image: myregistry/auth-service:v1.2.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: auth-service-config
+        env:
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: auth-db-secret
+              key: host
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: auth-db-secret
+              key: password
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: auth-jwt-secret
+              key: jwt_secret
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: 8080
+          failureThreshold: 30
+          periodSeconds: 5
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: "50Mi"
+---
+# Auth Service Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: microservices
+  labels:
+    app: auth-service
+spec:
+  selector:
+    app: auth-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  type: ClusterIP
+---
+# Auth Service ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auth-service-sa
+  namespace: microservices
+automountServiceAccountToken: false
+---
+# Auth Service HPA
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: auth-service-hpa
+  namespace: microservices
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: auth-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+      - type: Pods
+        value: 3
+        periodSeconds: 60
+```
+
+### Payment Service - YAML ครบ
+
+```yaml
+# payment-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: microservices
+  labels:
+    app: payment-service
+    version: v1
+    tier: backend
+    pci-dss: "true"   # PCI DSS compliance label
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payment-service
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: payment-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: payment-service-sa
+      # Security context เข้มงวดสำหรับ PCI DSS
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      # Dedicated nodes สำหรับ payment (taint + toleration)
+      tolerations:
+      - key: "workload-type"
+        operator: "Equal"
+        value: "payment"
+        effect: "NoSchedule"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: workload-type
+                operator: In
+                values:
+                - payment
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: payment-service
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: payment-service
+        image: myregistry/payment-service:v2.1.0
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: APP_ENV
+          value: "production"
+        - name: STRIPE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: payment-stripe-secret
+              key: api_key
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: payment-db-secret
+              key: url
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: payment-encryption-secret
+              key: key
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: audit-logs
+          mountPath: /var/log/audit
+      # Audit log sidecar (PCI DSS requirement)
+      - name: audit-log-collector
+        image: fluentd:v1.16
+        volumeMounts:
+        - name: audit-logs
+          mountPath: /var/log/audit
+          readOnly: true
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+      - name: audit-logs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: microservices
+  labels:
+    app: payment-service
+spec:
+  selector:
+    app: payment-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payment-service-sa
+  namespace: microservices
+automountServiceAccountToken: false
+```
+
+### Catalog Service - YAML ครบ
+
+```yaml
+# catalog-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-service
+  namespace: microservices
+  labels:
+    app: catalog-service
+    version: v1
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: catalog-service
+  template:
+    metadata:
+      labels:
+        app: catalog-service
+        version: v1
+    spec:
+      serviceAccountName: catalog-service-sa
+      containers:
+      - name: catalog-service
+        image: myregistry/catalog-service:v1.5.0
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: ELASTICSEARCH_URL
+          value: "http://elasticsearch.microservices.svc.cluster.local:9200"
+        - name: REDIS_URL
+          value: "redis://redis.microservices.svc.cluster.local:6379"
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: catalog-db-secret
+              key: url
+        - name: S3_BUCKET
+          value: "product-images"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-service
+  namespace: microservices
+spec:
+  selector:
+    app: catalog-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: catalog-service-sa
+  namespace: microservices
+  annotations:
+    # AWS IRSA สำหรับ access S3
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/CatalogServiceRole"
+automountServiceAccountToken: false
+```
+
+### User Service - YAML ครบ
+
+```yaml
+# user-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: microservices
+  labels:
+    app: user-service
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+        version: v1
+    spec:
+      serviceAccountName: user-service-sa
+      containers:
+      - name: user-service
+        image: myregistry/user-service:v1.3.0
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: grpc
+        env:
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: user-db-secret
+              key: url
+        - name: AUTH_SERVICE_URL
+          value: "http://auth-service.microservices.svc.cluster.local"
+        - name: KAFKA_BROKERS
+          value: "kafka.microservices.svc.cluster.local:9092"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: microservices
+spec:
+  selector:
+    app: user-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: grpc
+    port: 9090
+    targetPort: 9090
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: user-service-sa
+  namespace: microservices
+automountServiceAccountToken: false
+```
+
+### Notification Service - YAML ครบ
+
+```yaml
+# notification-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: microservices
+  labels:
+    app: notification-service
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+        version: v1
+    spec:
+      serviceAccountName: notification-service-sa
+      containers:
+      - name: notification-service
+        image: myregistry/notification-service:v1.1.0
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: KAFKA_BROKERS
+          value: "kafka.microservices.svc.cluster.local:9092"
+        - name: KAFKA_GROUP_ID
+          value: "notification-service"
+        - name: KAFKA_TOPICS
+          value: "user.events,order.events,payment.events"
+        - name: SENDGRID_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: notification-sendgrid-secret
+              key: api_key
+        - name: FIREBASE_CREDENTIALS
+          valueFrom:
+            secretKeyRef:
+              name: notification-firebase-secret
+              key: credentials
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: microservices
+spec:
+  selector:
+    app: notification-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notification-service-sa
+  namespace: microservices
+automountServiceAccountToken: false
+```
+
+---
+
+## Kong API Gateway - YAML ครบ
+
+```yaml
+# kong-deployment.yaml
+# ติดตั้ง Kong Gateway ด้วย Helm ก่อน
+# helm repo add kong https://charts.konghq.com
+# helm install kong kong/kong --namespace kong --create-namespace
+
+# Kong Ingress Class
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: kong
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: ingress-controllers.konghq.com/kong
+---
+# Rate Limiting Plugin (Global)
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: rate-limiting-global
+  namespace: microservices
+  annotations:
+    kubernetes.io/ingress.class: "kong"
+plugin: rate-limiting
+config:
+  minute: 100
+  hour: 1000
+  day: 10000
+  policy: redis
+  redis_host: redis.microservices.svc.cluster.local
+  redis_port: 6379
+  fault_tolerant: true
+  hide_client_headers: false
+---
+# JWT Authentication Plugin
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: jwt-auth
+  namespace: microservices
+plugin: jwt
+config:
+  uri_param_names:
+  - jwt
+  cookie_names:
+  - jwt
+  claims_to_verify:
+  - exp
+  key_claim_name: iss
+  secret_is_base64: false
+  run_on_preflight: true
+---
+# CORS Plugin
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: cors-plugin
+  namespace: microservices
+plugin: cors
+config:
+  origins:
+  - "https://app.example.com"
+  - "https://admin.example.com"
+  methods:
+  - GET
+  - POST
+  - PUT
+  - DELETE
+  - PATCH
+  - OPTIONS
+  headers:
+  - Accept
+  - Authorization
+  - Content-Type
+  - X-Request-ID
+  exposed_headers:
+  - X-Auth-Token
+  - X-Request-ID
+  credentials: true
+  max_age: 3600
+---
+# Request Size Limiting
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: request-size-limiter
+  namespace: microservices
+plugin: request-size-limiting
+config:
+  allowed_payload_size: 10
+  size_unit: megabytes
+---
+# IP Restriction (Whitelist สำหรับ admin)
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: admin-ip-restriction
+  namespace: microservices
+plugin: ip-restriction
+config:
+  allow:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  deny: []
+---
+# Ingress สำหรับ Auth Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-service-ingress
+  namespace: microservices
+  annotations:
+    kubernetes.io/ingress.class: "kong"
+    konghq.com/plugins: "rate-limiting-global,cors-plugin,request-size-limiter"
+    konghq.com/strip-path: "true"
+    konghq.com/protocols: "https"
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls-secret
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /auth
+        pathType: Prefix
+        backend:
+          service:
+            name: auth-service
+            port:
+              number: 80
+---
+# Ingress สำหรับ Payment Service (เพิ่ม JWT Auth)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: payment-service-ingress
+  namespace: microservices
+  annotations:
+    kubernetes.io/ingress.class: "kong"
+    konghq.com/plugins: "jwt-auth,rate-limiting-global,cors-plugin,request-size-limiter"
+    konghq.com/strip-path: "true"
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /payments
+        pathType: Prefix
+        backend:
+          service:
+            name: payment-service
+            port:
+              number: 80
+---
+# Ingress สำหรับ Catalog Service (Public)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: catalog-service-ingress
+  namespace: microservices
+  annotations:
+    kubernetes.io/ingress.class: "kong"
+    konghq.com/plugins: "rate-limiting-global,cors-plugin"
+    konghq.com/strip-path: "true"
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /catalog
+        pathType: Prefix
+        backend:
+          service:
+            name: catalog-service
+            port:
+              number: 80
+      - path: /products
+        pathType: Prefix
+        backend:
+          service:
+            name: catalog-service
+            port:
+              number: 80
+```
+
+---
+
+## Kafka Deployment - Strimzi Operator
+
+```yaml
+# strimzi-kafka.yaml
+# ติดตั้ง Strimzi Operator ก่อน
+# kubectl create namespace kafka
+# kubectl apply -f https://strimzi.io/install/latest?namespace=kafka -n kafka
+
+# Kafka Cluster
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: microservices-kafka
+  namespace: microservices
+spec:
+  kafka:
+    version: 3.6.0
+    replicas: 3
+    listeners:
+    - name: plain
+      port: 9092
+      type: internal
+      tls: false
+    - name: tls
+      port: 9093
+      type: internal
+      tls: true
+    - name: external
+      port: 9094
+      type: loadbalancer
+      tls: true
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      inter.broker.protocol.version: "3.6"
+      log.retention.hours: 168        # 7 วัน
+      log.retention.bytes: 1073741824 # 1GB per partition
+      log.segment.bytes: 536870912    # 512MB per segment
+    storage:
+      type: persistent-claim
+      size: 50Gi
+      class: fast-ssd
+      deleteClaim: false
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "500m"
+      limits:
+        memory: "4Gi"
+        cpu: "2000m"
+    jvmOptions:
+      -Xms: "1g"
+      -Xmx: "2g"
+    rack:
+      topologyKey: topology.kubernetes.io/zone
+    template:
+      pod:
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/name: microservices-kafka-kafka
+              topologyKey: kubernetes.io/hostname
+  zookeeper:
+    replicas: 3
+    storage:
+      type: persistent-claim
+      size: 10Gi
+      class: fast-ssd
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+---
+# Kafka Topics
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: user-events
+  namespace: microservices
+  labels:
+    strimzi.io/cluster: microservices-kafka
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: 604800000     # 7 วัน
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    max.message.bytes: "1048576" # 1MB
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: order-events
+  namespace: microservices
+  labels:
+    strimzi.io/cluster: microservices-kafka
+spec:
+  partitions: 24    # order traffic สูงกว่า
+  replicas: 3
+  config:
+    retention.ms: 2592000000    # 30 วัน
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: payment-events
+  namespace: microservices
+  labels:
+    strimzi.io/cluster: microservices-kafka
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: 7776000000    # 90 วัน (compliance)
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+---
+# Kafka User สำหรับ Services
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: notification-service-user
+  namespace: microservices
+  labels:
+    strimzi.io/cluster: microservices-kafka
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+    - resource:
+        type: topic
+        name: user-events
+        patternType: literal
+      operation: Read
+      host: "*"
+    - resource:
+        type: topic
+        name: order-events
+        patternType: literal
+      operation: Read
+      host: "*"
+    - resource:
+        type: topic
+        name: payment-events
+        patternType: literal
+      operation: Read
+      host: "*"
+    - resource:
+        type: group
+        name: notification-service
+        patternType: literal
+      operation: Read
+      host: "*"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: order-service-user
+  namespace: microservices
+  labels:
+    strimzi.io/cluster: microservices-kafka
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+    - resource:
+        type: topic
+        name: order-events
+        patternType: literal
+      operation: Write
+      host: "*"
+    - resource:
+        type: topic
+        name: order-events
+        patternType: literal
+      operation: Read
+      host: "*"
+    - resource:
+        type: group
+        name: order-service
+        patternType: literal
+      operation: Read
+      host: "*"
+```
+
+---
+
+## KEDA ScaledObject สำหรับ Kafka Consumers
+
+```yaml
+# keda-scaledobjects.yaml
+# ติดตั้ง KEDA ก่อน
+# helm repo add kedacore https://kedacore.github.io/charts
+# helm install keda kedacore/keda --namespace keda --create-namespace
+
+# ScaledObject สำหรับ Notification Service (Consumer ของ Kafka)
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: notification-service-scaler
+  namespace: microservices
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: notification-service
+  pollingInterval: 15          # ตรวจสอบทุก 15 วินาที
+  cooldownPeriod: 60           # รอ 60 วินาทีก่อน scale down
+  idleReplicaCount: 1          # minimum 1 เมื่อ idle
+  minReplicaCount: 2           # minimum 2 เมื่อมี messages
+  maxReplicaCount: 20          # maximum 20
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+  # Scale ตาม lag ของ user-events topic
+  - type: kafka
+    metadata:
+      bootstrapServers: "microservices-kafka-kafka-bootstrap.microservices.svc.cluster.local:9092"
+      consumerGroup: notification-service
+      topic: user-events
+      lagThreshold: "100"          # Scale เมื่อ lag > 100 messages
+      offsetResetPolicy: latest
+  # Scale ตาม lag ของ order-events topic
+  - type: kafka
+    metadata:
+      bootstrapServers: "microservices-kafka-kafka-bootstrap.microservices.svc.cluster.local:9092"
+      consumerGroup: notification-service
+      topic: order-events
+      lagThreshold: "50"
+      offsetResetPolicy: latest
+  # Scale ตาม lag ของ payment-events topic
+  - type: kafka
+    metadata:
+      bootstrapServers: "microservices-kafka-kafka-bootstrap.microservices.svc.cluster.local:9092"
+      consumerGroup: notification-service
+      topic: payment-events
+      lagThreshold: "20"           # payment เร่งด่วนกว่า
+      offsetResetPolicy: latest
+---
+# ScaledObject สำหรับ Order Processor
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-processor-scaler
+  namespace: microservices
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-processor
+  minReplicaCount: 3
+  maxReplicaCount: 50
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: "microservices-kafka-kafka-bootstrap.microservices.svc.cluster.local:9092"
+      consumerGroup: order-processor
+      topic: order-events
+      lagThreshold: "10"    # Strict threshold สำหรับ orders
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      metricName: order_queue_depth
+      query: |
+        sum(kafka_consumer_group_lag{topic="order-events", consumergroup="order-processor"})
+      threshold: "10"
+---
+# TriggerAuthentication สำหรับ SCRAM-SHA-512
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: kafka-auth
+  namespace: microservices
+spec:
+  secretTargetRef:
+  - parameter: sasl
+    name: keda-kafka-secret
+    key: sasl
+  - parameter: username
+    name: keda-kafka-secret
+    key: username
+  - parameter: password
+    name: keda-kafka-secret
+    key: password
+---
+# ScaledJob สำหรับ Batch Processing
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: report-generator
+  namespace: microservices
+spec:
+  jobTargetRef:
+    template:
+      spec:
+        containers:
+        - name: report-generator
+          image: myregistry/report-generator:v1.0.0
+          env:
+          - name: KAFKA_BOOTSTRAP_SERVERS
+            value: "microservices-kafka-kafka-bootstrap.microservices.svc.cluster.local:9092"
+        restartPolicy: Never
+  pollingInterval: 30
+  maxReplicaCount: 10
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: "microservices-kafka-kafka-bootstrap.microservices.svc.cluster.local:9092"
+      consumerGroup: report-generator
+      topic: report-requests
+      lagThreshold: "1"
+```
+
+---
+
+## Istio VirtualService และ DestinationRule - ทุก Service
+
+```yaml
+# istio-config.yaml
+
+# ========== Auth Service ==========
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: auth-service-vs
+  namespace: microservices
+spec:
+  hosts:
+  - auth-service
+  http:
+  - match:
+    - headers:
+        x-api-version:
+          exact: "v2"
+    route:
+    - destination:
+        host: auth-service
+        subset: v2
+      weight: 100
+  - route:
+    - destination:
+        host: auth-service
+        subset: v1
+      weight: 100
+    timeout: 10s
+    retries:
+      attempts: 3
+      perTryTimeout: 3s
+      retryOn: "5xx,reset,connect-failure,retriable-4xx"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: auth-service-dr
+  namespace: microservices
+spec:
+  host: auth-service
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+        maxRetries: 3
+      tcp:
+        maxConnections: 100
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+    loadBalancer:
+      simple: LEAST_CONN
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+
+# ========== Payment Service ==========
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: payment-service-vs
+  namespace: microservices
+spec:
+  hosts:
+  - payment-service
+  http:
+  - route:
+    - destination:
+        host: payment-service
+        subset: v1
+      weight: 100
+    timeout: 30s    # payment ต้องการ timeout นานกว่า
+    retries:
+      attempts: 2   # payment ไม่ควร retry เยอะ (idempotency)
+      perTryTimeout: 15s
+      retryOn: "connect-failure,retriable-4xx"
+    fault:
+      # สำหรับ testing - inject delay 10% ของ requests
+      # delay:
+      #   percentage:
+      #     value: 10
+      #   fixedDelay: 2s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: payment-service-dr
+  namespace: microservices
+spec:
+  host: payment-service
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 500
+      tcp:
+        maxConnections: 50
+        connectTimeout: 5s
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 5s
+      baseEjectionTime: 60s    # eject นานกว่าสำหรับ payment
+      maxEjectionPercent: 30
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+
+# ========== Catalog Service ==========
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: catalog-service-vs
+  namespace: microservices
+spec:
+  hosts:
+  - catalog-service
+  http:
+  # Canary deployment: 10% ไป v2
+  - route:
+    - destination:
+        host: catalog-service
+        subset: v1
+      weight: 90
+    - destination:
+        host: catalog-service
+        subset: v2
+      weight: 10
+    timeout: 5s
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: catalog-service-dr
+  namespace: microservices
+spec:
+  host: catalog-service
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 200
+        http2MaxRequests: 2000
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+
+# ========== User Service ==========
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: user-service-vs
+  namespace: microservices
+spec:
+  hosts:
+  - user-service
+  http:
+  - route:
+    - destination:
+        host: user-service
+        subset: v1
+      weight: 100
+    timeout: 10s
+    retries:
+      attempts: 3
+      perTryTimeout: 3s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: user-service-dr
+  namespace: microservices
+spec:
+  host: user-service
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+
+# ========== Notification Service ==========
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: notification-service-vs
+  namespace: microservices
+spec:
+  hosts:
+  - notification-service
+  http:
+  - route:
+    - destination:
+        host: notification-service
+        subset: v1
+      weight: 100
+    timeout: 5s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: notification-service-dr
+  namespace: microservices
+spec:
+  host: notification-service
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 50
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+
+# ========== PeerAuthentication (mTLS ทั้ง namespace) ==========
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: microservices
+spec:
+  mtls:
+    mode: STRICT   # บังคับ mTLS ทุก connections
+```
+
+---
+
+## Monitoring: ServiceMonitor + PrometheusRule
+
+```yaml
+# monitoring.yaml
+
+# ========== ServiceMonitors ==========
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: auth-service-monitor
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+    - microservices
+  selector:
+    matchLabels:
+      app: auth-service
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payment-service-monitor
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+    - microservices
+  selector:
+    matchLabels:
+      app: payment-service
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: catalog-service-monitor
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+    - microservices
+  selector:
+    matchLabels:
+      app: catalog-service
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+---
+# ========== PrometheusRules ==========
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: microservices-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+  - name: microservices.availability
+    interval: 30s
+    rules:
+    # Auth Service Availability
+    - alert: AuthServiceDown
+      expr: |
+        sum(up{job="auth-service"}) == 0
+      for: 1m
+      labels:
+        severity: critical
+        service: auth-service
+        team: platform
+      annotations:
+        summary: "Auth Service is down"
+        description: "All Auth Service pods are down for more than 1 minute"
+        runbook: "https://runbooks.example.com/auth-service-down"
+    
+    # Payment Service Error Rate
+    - alert: PaymentServiceHighErrorRate
+      expr: |
+        sum(rate(http_requests_total{job="payment-service", status=~"5.."}[5m])) /
+        sum(rate(http_requests_total{job="payment-service"}[5m])) > 0.05
+      for: 2m
+      labels:
+        severity: critical
+        service: payment-service
+      annotations:
+        summary: "Payment Service error rate > 5%"
+        description: "Payment Service is experiencing {{ $value | humanizePercentage }} error rate"
+    
+    # Payment Service Latency
+    - alert: PaymentServiceHighLatency
+      expr: |
+        histogram_quantile(0.99, 
+          sum(rate(http_request_duration_seconds_bucket{job="payment-service"}[5m])) by (le)
+        ) > 3
+      for: 5m
+      labels:
+        severity: warning
+        service: payment-service
+      annotations:
+        summary: "Payment Service P99 latency > 3s"
+    
+    # Catalog Service Latency
+    - alert: CatalogServiceHighLatency
+      expr: |
+        histogram_quantile(0.95,
+          sum(rate(http_request_duration_seconds_bucket{job="catalog-service"}[5m])) by (le)
+        ) > 1
+      for: 5m
+      labels:
+        severity: warning
+        service: catalog-service
+      annotations:
+        summary: "Catalog Service P95 latency > 1s"
+  
+  - name: microservices.kafka
+    rules:
+    # Kafka Consumer Lag
+    - alert: KafkaConsumerLagHigh
+      expr: |
+        sum(kafka_consumer_group_lag{consumergroup=~"notification.*"}) > 1000
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Kafka consumer lag is high"
+        description: "Notification service consumer lag: {{ $value }}"
+    
+    # Kafka Consumer Lag Critical
+    - alert: KafkaConsumerLagCritical
+      expr: |
+        sum(kafka_consumer_group_lag{consumergroup="payment-processor"}) > 100
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Payment Kafka consumer lag is critically high"
+  
+  - name: microservices.slo
+    rules:
+    # Auth Service SLO: 99.9% availability
+    - record: auth_service:availability:5m
+      expr: |
+        sum(rate(http_requests_total{job="auth-service", status!~"5.."}[5m])) /
+        sum(rate(http_requests_total{job="auth-service"}[5m]))
+    
+    - alert: AuthServiceSLOBreach
+      expr: auth_service:availability:5m < 0.999
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Auth Service SLO breach: availability {{ $value | humanizePercentage }}"
+    
+    # Payment Service SLO: 99.99% success rate
+    - record: payment_service:success_rate:5m
+      expr: |
+        sum(rate(payment_transactions_total{status="success"}[5m])) /
+        sum(rate(payment_transactions_total[5m]))
+    
+    - alert: PaymentSLOBreach
+      expr: payment_service:success_rate:5m < 0.9999
+      for: 2m
+      labels:
+        severity: critical
+        pci_dss: "true"
+      annotations:
+        summary: "Payment Service SLO breach: success rate {{ $value | humanizePercentage }}"
+```
+
+---
+
+## Workshop: Deploy ทีละขั้นตอนพร้อม Verification
+
+### Phase 1: ติดตั้ง Infrastructure
+
+```bash
+#!/bin/bash
+# deploy-phase1-infrastructure.sh
+set -euo pipefail
+
+NAMESPACE="microservices"
+echo "=== Phase 1: Setting up Infrastructure ==="
+
+# Create namespace
+kubectl create namespace $NAMESPACE || true
+kubectl label namespace $NAMESPACE istio-injection=enabled --overwrite
+
+# ติดตั้ง operators
+echo "Installing Strimzi Kafka Operator..."
+kubectl create namespace kafka || true
+kubectl apply -f https://strimzi.io/install/latest?namespace=kafka -n kafka
+kubectl wait --for=condition=Ready pods \
+  -l name=strimzi-cluster-operator \
+  -n kafka --timeout=120s
+
+echo "Installing KEDA..."
+helm repo add kedacore https://kedacore.github.io/charts
+helm upgrade --install keda kedacore/keda \
+  --namespace keda \
+  --create-namespace \
+  --wait
+
+echo "Installing Kong..."
+helm repo add kong https://charts.konghq.com
+helm upgrade --install kong kong/kong \
+  --namespace kong \
+  --create-namespace \
+  --set ingressController.installCRDs=false \
+  --wait
+
+echo "=== Phase 1 Complete ==="
+```
+
+### Phase 2: Deploy Kafka
+
+```bash
+# deploy-phase2-kafka.sh
+echo "=== Phase 2: Deploying Kafka ==="
+
+# Apply Kafka cluster
+kubectl apply -f strimzi-kafka.yaml
+
+# รอ Kafka พร้อม
+echo "Waiting for Kafka cluster to be ready..."
+kubectl wait kafka/microservices-kafka \
+  --for=condition=Ready \
+  --timeout=300s \
+  -n microservices
+
+# Verify Kafka topics
+echo "Checking Kafka topics..."
+kubectl get kafkatopics -n microservices
+
+# ทดสอบ Kafka ด้วย test producer/consumer
+echo "Testing Kafka..."
+kubectl run kafka-test \
+  --image=quay.io/strimzi/kafka:latest-kafka-3.6.0 \
+  --rm -it \
+  --restart=Never \
+  -n microservices \
+  -- bin/kafka-topics.sh \
+    --bootstrap-server microservices-kafka-kafka-bootstrap:9092 \
+    --list
+
+echo "=== Phase 2 Complete ==="
+```
+
+### Phase 3: Deploy Services
+
+```bash
+# deploy-phase3-services.sh
+echo "=== Phase 3: Deploying Microservices ==="
+
+SERVICES=("auth-service" "user-service" "catalog-service" "payment-service" "notification-service")
+
+# Apply all service manifests
+for service in "${SERVICES[@]}"; do
+    echo "Deploying $service..."
+    kubectl apply -f "${service}.yaml"
+done
+
+# รอทุก services พร้อม
+echo "Waiting for all services to be ready..."
+for service in "${SERVICES[@]}"; do
+    kubectl wait deployment/$service \
+      --for=condition=Available \
+      --timeout=120s \
+      -n microservices
+    echo "✅ $service is ready"
+done
+
+# ตรวจสอบ pods
+kubectl get pods -n microservices -o wide
+
+echo "=== Phase 3 Complete ==="
+```
+
+### Phase 4: Apply Istio Configuration
+
+```bash
+# deploy-phase4-istio.sh
+echo "=== Phase 4: Configuring Istio ==="
+
+# Apply VirtualServices และ DestinationRules
+kubectl apply -f istio-config.yaml
+
+# Verify Istio sidecars
+echo "Checking Istio sidecar injection..."
+kubectl get pods -n microservices \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[*].name}{"\n"}{end}' | \
+  grep "istio-proxy"
+
+# ตรวจสอบ mTLS
+kubectl exec -n microservices \
+  $(kubectl get pod -n microservices -l app=auth-service -o jsonpath='{.items[0].metadata.name}') \
+  -- curl -sv http://user-service.microservices.svc.cluster.local/health 2>&1 | \
+  grep -E "(SSL|TLS|ALPN|HTTP)"
+
+echo "=== Phase 4 Complete ==="
+```
+
+### Phase 5: Setup Monitoring
+
+```bash
+# deploy-phase5-monitoring.sh
+echo "=== Phase 5: Setting up Monitoring ==="
+
+# Apply ServiceMonitors and PrometheusRules
+kubectl apply -f monitoring.yaml
+
+# Verify metrics are being scraped
+sleep 30
+echo "Checking Prometheus targets..."
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090 &
+PROM_PID=$!
+sleep 3
+
+curl -s "http://localhost:9090/api/v1/targets" | \
+  jq -r '.data.activeTargets[] | select(.labels.namespace == "microservices") | 
+    "\(.labels.job): \(.health)"' | sort
+
+kill $PROM_PID 2>/dev/null
+echo "=== Phase 5 Complete ==="
+```
+
+### Phase 6: End-to-End Verification
+
+```bash
+#!/bin/bash
+# e2e-verification.sh
+echo "=== End-to-End Verification ==="
+
+NAMESPACE="microservices"
+
+# 1. Check all pods running
+echo -e "\n[1] Pod Status:"
+kubectl get pods -n $NAMESPACE \
+  -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,RESTARTS:.status.containerStatuses[0].restartCount'
+
+# 2. Check services
+echo -e "\n[2] Services:"
+kubectl get svc -n $NAMESPACE
+
+# 3. Check Kafka topics
+echo -e "\n[3] Kafka Topics:"
+kubectl get kafkatopics -n $NAMESPACE \
+  -o custom-columns='NAME:.metadata.name,PARTITIONS:.spec.partitions,REPLICAS:.spec.replicas'
+
+# 4. Check KEDA scalers
+echo -e "\n[4] KEDA ScaledObjects:"
+kubectl get scaledobjects -n $NAMESPACE
+
+# 5. Test auth service
+echo -e "\n[5] Auth Service Health:"
+kubectl exec -n $NAMESPACE \
+  $(kubectl get pod -n $NAMESPACE -l app=auth-service -o jsonpath='{.items[0].metadata.name}') \
+  -- wget -qO- http://localhost:8080/health/ready
+
+# 6. Check Istio config
+echo -e "\n[6] Istio VirtualServices:"
+kubectl get virtualservices -n $NAMESPACE
+
+echo -e "\n[7] Istio DestinationRules:"
+kubectl get destinationrules -n $NAMESPACE
+
+# 7. Check mTLS
+echo -e "\n[8] mTLS Status:"
+kubectl get peerauthentication -n $NAMESPACE
+
+# 8. Check HPA
+echo -e "\n[9] HPA Status:"
+kubectl get hpa -n $NAMESPACE
+
+# 9. Load test (optional)
+echo -e "\n[10] Quick Load Test (10 requests):"
+kubectl run load-test \
+  --image=busybox:latest \
+  --rm -it \
+  --restart=Never \
+  -n $NAMESPACE \
+  -- sh -c '
+    for i in $(seq 1 10); do
+      wget -qO- http://auth-service.microservices.svc.cluster.local/health/ready
+      echo ""
+    done
+  ' 2>/dev/null
+
+echo -e "\n=== Verification Complete ==="
+```
+
+---
+
+## สรุปเพิ่มเติม
+
+### Microservices Architecture Summary
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                     Internet / Users                           │
+└─────────────────────────┬─────────────────────────────────────┘
+                          │
+                          ▼
+┌───────────────────────────────────────────────────────────────┐
+│              Kong API Gateway (kong namespace)                 │
+│  Rate Limiting | JWT Auth | CORS | SSL Termination            │
+└──────┬──────────────┬──────────────┬────────────┬─────────────┘
+       │              │              │            │
+       ▼              ▼              ▼            ▼
+┌──────────┐  ┌──────────────┐  ┌────────┐  ┌──────────┐
+│   Auth   │  │   Catalog    │  │  User  │  │ Payment  │
+│ Service  │  │   Service    │  │Service │  │ Service  │
+│  (3 pods)│  │   (4 pods)   │  │(3 pods)│  │ (3 pods) │
+└──────────┘  └──────────────┘  └────────┘  └──────────┘
+                                                  │
+                   Kafka Events                   │
+       ┌──────────────────────────────────────────┘
+       │       (Strimzi Kafka, 3 brokers)
+       ▼
+┌──────────────┐
+│ Notification │◄── KEDA (scale ตาม Kafka lag)
+│   Service    │
+│   (2-20 pods)│
+└──────────────┘
+
+Observability Stack:
+├── Prometheus + Grafana (metrics)
+├── Loki (logs)
+├── Jaeger (traces)
+└── Kiali (service mesh topology)
+```
+
+### Quick Reference Commands
+
+```bash
+# ดู status ทุกอย่าง
+kubectl get all -n microservices
+
+# ดู Istio topology
+kubectl port-forward -n istio-system svc/kiali 20001:20001
+# เปิด http://localhost:20001
+
+# ดู traces
+kubectl port-forward -n monitoring svc/jaeger-query 16686:16686
+# เปิด http://localhost:16686
+
+# ดู metrics
+kubectl port-forward -n monitoring svc/grafana 3000:3000
+# เปิด http://localhost:3000
+
+# Scale service manually
+kubectl scale deployment/catalog-service \
+  --replicas=6 \
+  -n microservices
+
+# Rolling restart
+kubectl rollout restart deployment/auth-service -n microservices
+kubectl rollout status deployment/auth-service -n microservices
+
+# Canary: ส่ง 20% traffic ไป v2
+kubectl patch virtualservice catalog-service-vs -n microservices \
+  --type json \
+  -p '[
+    {"op":"replace","path":"/spec/http/0/route/0/weight","value":80},
+    {"op":"replace","path":"/spec/http/0/route/1/weight","value":20}
+  ]'
+```
