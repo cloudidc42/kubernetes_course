@@ -996,3 +996,920 @@ ReplicaSet เป็น Controller สำคัญใน Kubernetes ที่:
 - ง่ายต่อการจัดการมากกว่า
 
 ในบทต่อไปเราจะเรียนรู้ **Deployment** ซึ่งเป็น Higher-level Controller ที่ใช้งานจริงใน Production
+
+---
+
+## ReplicaSet Ownership และ Adoption
+
+### ความหมายของ Ownership
+
+ใน Kubernetes ทุก Resource สามารถมี "Owner" ได้ผ่าน `ownerReferences` ใน metadata เมื่อ ReplicaSet สร้าง Pod จะตั้ง ownerReference ให้ Pod นั้นชี้กลับมาที่ ReplicaSet
+
+```yaml
+# ตัวอย่าง ownerReference ที่ ReplicaSet ตั้งให้ Pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-rs-abc12
+  ownerReferences:
+  - apiVersion: apps/v1
+    kind: ReplicaSet
+    name: my-rs
+    uid: 9dbf0c6f-c0b9-4e8a-a1d2-5f12345abc67
+    controller: true
+    blockOwnerDeletion: true
+```
+
+### คุณสมบัติของ ownerReferences
+
+| Field | ความหมาย |
+|-------|----------|
+| `controller: true` | Resource นี้ถูก manage โดย controller นี้ |
+| `blockOwnerDeletion: true` | ห้ามลบ Owner จนกว่า Resource นี้จะถูกลบก่อน |
+| `uid` | UID ของ Owner ใช้ตรวจสอบว่าเป็น Owner ตัวจริง |
+
+### Garbage Collection
+
+เมื่อลบ ReplicaSet ด้วย `--cascade=foreground` (default) Kubernetes จะ:
+1. ตั้ง `deletionTimestamp` บน ReplicaSet
+2. GarbageCollector ลบ Pods ที่ ownerReference ชี้มาที่ ReplicaSet นั้น
+3. เมื่อ Pods ถูกลบหมดแล้ว จึงลบ ReplicaSet ออก
+
+```bash
+# ลบ ReplicaSet และ Pods ที่เกี่ยวข้อง (default)
+kubectl delete replicaset my-rs
+
+# ลบ ReplicaSet อย่างเดียว ไม่ลบ Pods (Orphan)
+kubectl delete replicaset my-rs --cascade=orphan
+
+# ดู Pods ที่ถูก Orphan (ไม่มี ownerReference อีกต่อไป)
+kubectl get pods --show-labels
+```
+
+### Pod Adoption
+
+ReplicaSet สามารถ "adopt" Pod ที่ไม่มี owner ได้ถ้า Pod นั้น match กับ selector ของ ReplicaSet
+
+```yaml
+# สถานการณ์: มี orphan Pod อยู่ก่อน
+apiVersion: v1
+kind: Pod
+metadata:
+  name: standalone-pod
+  labels:
+    app: my-app
+    version: "1.0"
+spec:
+  containers:
+  - name: app
+    image: nginx:1.20
+```
+
+```yaml
+# สร้าง ReplicaSet ที่ selector ตรงกัน
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: adopting-rs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+        version: "1.0"
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.20
+```
+
+เมื่อสร้าง `adopting-rs` ด้วย replicas=3 แต่มี orphan Pod ที่ match อยู่แล้ว 1 ตัว:
+- ReplicaSet จะ adopt orphan Pod นั้น
+- สร้าง Pod เพิ่มอีกเพียง 2 ตัว (ไม่ใช่ 3)
+
+```bash
+# ตรวจสอบว่า Pod ถูก adopt หรือไม่
+kubectl get pod standalone-pod -o yaml | grep -A5 ownerReferences
+
+# ผลลัพธ์จะแสดง ownerReference ชี้มาที่ adopting-rs
+```
+
+### การป้องกัน Unintended Adoption
+
+```yaml
+# ใช้ selector ที่เฉพาะเจาะจงเพื่อป้องกัน accidental adoption
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: specific-rs
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-app
+      # เพิ่ม unique label เพื่อป้องกัน accidental match
+      rs-managed: "specific-rs-v1"
+  template:
+    metadata:
+      labels:
+        app: my-app
+        rs-managed: "specific-rs-v1"
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.20
+```
+
+---
+
+## ReplicaSet vs ReplicationController
+
+### ประวัติ
+
+- **ReplicationController**: เครื่องมือดั้งเดิมก่อน Kubernetes 1.2
+- **ReplicaSet**: แนะนำใน Kubernetes 1.2 เพื่อแทน ReplicationController
+- **ความแตกต่างหลัก**: ReplicaSet รองรับ set-based selectors ที่ทรงพลังกว่า
+
+### เปรียบเทียบ YAML
+
+```yaml
+# ReplicationController (รูปแบบเก่า)
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: old-style-rc
+spec:
+  replicas: 3
+  # selector ใช้ map ธรรมดา - รองรับเฉพาะ equality-based
+  selector:
+    app: nginx
+    version: "1.0"
+  template:
+    metadata:
+      labels:
+        app: nginx
+        version: "1.0"
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+        ports:
+        - containerPort: 80
+```
+
+```yaml
+# ReplicaSet (รูปแบบใหม่)
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: new-style-rs
+spec:
+  replicas: 3
+  # selector ใช้ matchLabels และ matchExpressions
+  selector:
+    matchLabels:
+      app: nginx
+    matchExpressions:
+    - key: version
+      operator: In
+      values: ["1.0", "1.1", "1.2"]
+    - key: environment
+      operator: NotIn
+      values: ["deprecated"]
+  template:
+    metadata:
+      labels:
+        app: nginx
+        version: "1.0"
+        environment: production
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+        ports:
+        - containerPort: 80
+```
+
+### ตารางเปรียบเทียบคุณสมบัติ
+
+| คุณสมบัติ | ReplicationController | ReplicaSet |
+|-----------|----------------------|------------|
+| Equality-based selector | รองรับ | รองรับ |
+| Set-based selector | ไม่รองรับ | รองรับ |
+| ใช้โดย Deployment | ไม่ | ใช่ |
+| API Group | core (v1) | apps/v1 |
+| Status ใน Kubernetes | Deprecated | Active |
+| แนะนำให้ใช้ | ไม่ | ใช่ (ผ่าน Deployment) |
+
+### คำสั่ง Migration
+
+```bash
+# ตรวจสอบ ReplicationControllers ที่มีอยู่
+kubectl get replicationcontrollers --all-namespaces
+
+# แสดงรายละเอียด ReplicationController
+kubectl describe rc old-style-rc
+
+# แปลง ReplicationController เป็น ReplicaSet
+# ขั้นตอน:
+# 1. Backup manifest เดิม
+kubectl get rc old-style-rc -o yaml > rc-backup.yaml
+
+# 2. Scale RC เป็น 0
+kubectl scale rc old-style-rc --replicas=0
+
+# 3. สร้าง ReplicaSet ใหม่
+kubectl apply -f new-replicaset.yaml
+
+# 4. ตรวจสอบว่า RS ทำงานถูกต้อง
+kubectl get rs new-style-rs
+
+# 5. ลบ RC เก่า
+kubectl delete rc old-style-rc
+```
+
+---
+
+## Debugging ReplicaSet ที่ไม่ Scale
+
+### สถานการณ์ที่พบบ่อย
+
+#### 1. Pods ไม่ถูกสร้างเพิ่ม
+
+```bash
+# ตรวจสอบ ReplicaSet status
+kubectl describe rs my-rs
+
+# มองหาใน Events section:
+# - FailedCreate: ไม่สามารถสร้าง Pod ได้
+# - SuccessfulCreate: สร้าง Pod สำเร็จ
+# - SuccessfulDelete: ลบ Pod สำเร็จ
+
+# ดู Events ทั้งหมดใน namespace
+kubectl get events --sort-by='.lastTimestamp'
+```
+
+#### 2. Pods อยู่ใน Pending State
+
+```bash
+# ดู Pending Pods
+kubectl get pods | grep Pending
+
+# ตรวจสอบสาเหตุ
+kubectl describe pod <pending-pod-name>
+
+# สาเหตุที่พบบ่อย:
+# - Insufficient resources (CPU/Memory)
+# - No nodes match nodeSelector/affinity
+# - PVC ไม่สามารถ bind ได้
+# - Taints/Tolerations ไม่ตรงกัน
+```
+
+#### 3. Pods ถูกสร้างแล้วล้มเหลว
+
+```bash
+# ดู Pods ที่ CrashLoopBackOff
+kubectl get pods | grep -E "Error|CrashLoop|OOMKilled"
+
+# ดู logs ของ Pod ที่ fail
+kubectl logs <pod-name> --previous
+
+# ดู container exit code
+kubectl get pod <pod-name> -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}'
+```
+
+#### 4. ReplicaSet ไม่ match กับ Pods ที่มีอยู่
+
+```bash
+# ตรวจสอบ labels ของ Pods
+kubectl get pods --show-labels
+
+# ตรวจสอบ selector ของ ReplicaSet
+kubectl get rs my-rs -o jsonpath='{.spec.selector}'
+
+# เปรียบเทียบ labels กับ selector
+kubectl get rs my-rs -o yaml | grep -A10 selector
+```
+
+### Script Debugging อัตโนมัติ
+
+```bash
+#!/bin/bash
+# debug-replicaset.sh - ตรวจสอบ ReplicaSet แบบอัตโนมัติ
+
+RS_NAME="${1:-my-rs}"
+NAMESPACE="${2:-default}"
+
+echo "=== ReplicaSet Debug Report: $RS_NAME ==="
+echo ""
+
+# 1. ตรวจสอบ RS status
+echo "--- ReplicaSet Status ---"
+kubectl get rs "$RS_NAME" -n "$NAMESPACE"
+echo ""
+
+# 2. ตรวจสอบ desired vs current
+DESIRED=$(kubectl get rs "$RS_NAME" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.replicas}')
+READY=$(kubectl get rs "$RS_NAME" -n "$NAMESPACE" \
+    -o jsonpath='{.status.readyReplicas}')
+CURRENT=$(kubectl get rs "$RS_NAME" -n "$NAMESPACE" \
+    -o jsonpath='{.status.replicas}')
+
+echo "Desired: $DESIRED, Current: $CURRENT, Ready: $READY"
+
+if [ "$DESIRED" != "$READY" ]; then
+    echo "WARNING: Not all replicas are ready!"
+fi
+echo ""
+
+# 3. ตรวจสอบ Pods
+echo "--- Pods managed by $RS_NAME ---"
+SELECTOR=$(kubectl get rs "$RS_NAME" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.selector.matchLabels}' | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); \
+    print(','.join([f'{k}={v}' for k,v in d.items()]))")
+
+kubectl get pods -n "$NAMESPACE" -l "$SELECTOR" -o wide
+echo ""
+
+# 4. ดู Events ที่เกี่ยวข้อง
+echo "--- Recent Events ---"
+kubectl get events -n "$NAMESPACE" \
+    --field-selector "involvedObject.name=$RS_NAME" \
+    --sort-by='.lastTimestamp' | tail -10
+echo ""
+
+# 5. ตรวจสอบ Node resources
+echo "--- Node Resource Availability ---"
+kubectl describe nodes | grep -A5 "Allocated resources"
+```
+
+### แก้ปัญหา Image Pull Error
+
+```bash
+# ตรวจสอบ image pull error
+kubectl describe pod <pod-name> | grep -A5 "Events:"
+# หากเห็น: Failed to pull image "myimage:tag"
+
+# แก้ไข: ตรวจสอบ ImagePullSecrets
+kubectl get rs my-rs -o yaml | grep imagePullSecrets
+
+# เพิ่ม imagePullSecrets ถ้าจำเป็น
+kubectl patch serviceaccount default \
+    -p '{"imagePullSecrets": [{"name": "registry-secret"}]}'
+
+# หรือแก้ไข ReplicaSet template
+kubectl edit rs my-rs
+# เพิ่มใน spec.template.spec:
+# imagePullSecrets:
+# - name: registry-secret
+```
+
+### แก้ปัญหา Resource Quota Exceeded
+
+```bash
+# ตรวจสอบ ResourceQuota ใน namespace
+kubectl describe resourcequota -n my-namespace
+
+# ดู Events เกี่ยวกับ quota
+kubectl get events -n my-namespace | grep -i quota
+
+# แก้ไข: เพิ่ม Quota
+kubectl patch resourcequota my-quota -n my-namespace \
+    --type=merge \
+    -p '{"spec":{"hard":{"pods":"20","requests.cpu":"4"}}}'
+```
+
+---
+
+## แบบฝึกหัด: ReplicaSets
+
+### แบบฝึกหัดที่ 1: สร้างและตรวจสอบ ReplicaSet พื้นฐาน
+
+**โจทย์**: สร้าง ReplicaSet ชื่อ `web-rs` ที่รัน Nginx 3 replicas
+
+**ขั้นตอน**:
+```bash
+# 1. สร้างไฟล์ web-rs.yaml
+cat > web-rs.yaml << 'EOF'
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-rs
+  labels:
+    app: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+EOF
+
+# 2. Apply
+kubectl apply -f web-rs.yaml
+
+# 3. ตรวจสอบ
+kubectl get rs web-rs
+kubectl get pods -l app=web
+```
+
+**เฉลย - การตรวจสอบ**:
+```bash
+# ผลลัพธ์ที่ถูกต้อง:
+NAME     DESIRED   CURRENT   READY   AGE
+web-rs   3         3         3       30s
+
+# Pods ที่ควรเห็น:
+NAME           READY   STATUS    RESTARTS   AGE
+web-rs-abc12   1/1     Running   0          30s
+web-rs-def34   1/1     Running   0          30s
+web-rs-ghi56   1/1     Running   0          30s
+```
+
+---
+
+### แบบฝึกหัดที่ 2: ทดสอบ Self-healing
+
+**โจทย์**: ลบ Pod หนึ่งตัวจาก ReplicaSet และสังเกตว่า ReplicaSet สร้าง Pod ใหม่
+
+```bash
+# 1. ดู Pods ปัจจุบัน
+kubectl get pods -l app=web
+
+# 2. ลบ Pod หนึ่งตัว (ใช้ชื่อจากขั้นตอนที่ 1)
+kubectl delete pod web-rs-abc12
+
+# 3. สังเกตการสร้าง Pod ใหม่
+kubectl get pods -l app=web -w
+```
+
+**เฉลย**:
+```
+# ขณะลบ Pod จะเห็น:
+web-rs-abc12   1/1     Terminating   0          2m
+web-rs-xyz99   0/1     ContainerCreating   0   1s
+
+# หลังจากนั้น:
+web-rs-def34   1/1     Running   0          2m
+web-rs-ghi56   1/1     Running   0          2m
+web-rs-xyz99   1/1     Running   0          15s
+# (abc12 ถูกแทนที่ด้วย xyz99)
+```
+
+---
+
+### แบบฝึกหัดที่ 3: Scale ReplicaSet
+
+**โจทย์**: Scale `web-rs` จาก 3 เป็น 5 replicas ด้วย 3 วิธีต่างกัน
+
+**เฉลย**:
+```bash
+# วิธีที่ 1: kubectl scale
+kubectl scale rs web-rs --replicas=5
+
+# วิธีที่ 2: kubectl patch
+kubectl patch rs web-rs -p '{"spec":{"replicas":5}}'
+
+# วิธีที่ 3: แก้ไขไฟล์ YAML แล้ว apply ใหม่
+# แก้ไข replicas: 3 → replicas: 5 ใน web-rs.yaml
+kubectl apply -f web-rs.yaml
+
+# ตรวจสอบ
+kubectl get rs web-rs
+# ควรแสดง DESIRED=5, CURRENT=5, READY=5
+```
+
+---
+
+### แบบฝึกหัดที่ 4: Set-based Selector
+
+**โจทย์**: สร้าง ReplicaSet ที่ใช้ `matchExpressions` เพื่อจัดการ Pods ที่มี tier เป็น `frontend` หรือ `backend`
+
+**เฉลย**:
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: multi-tier-rs
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: myapp
+    matchExpressions:
+    - key: tier
+      operator: In
+      values: ["frontend", "backend"]
+    - key: environment
+      operator: NotIn
+      values: ["deprecated", "test"]
+  template:
+    metadata:
+      labels:
+        app: myapp
+        tier: frontend
+        environment: production
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.21
+```
+
+---
+
+### แบบฝึกหัดที่ 5: Orphan Pods และ Adoption
+
+**โจทย์**: ทำความเข้าใจ Pod Adoption โดย:
+1. สร้าง standalone Pod ที่มี labels ตรงกัน
+2. สร้าง ReplicaSet ที่ match กับ Pod นั้น
+3. สังเกตว่า RS adopt Pod แทนที่จะสร้างใหม่
+
+**เฉลย**:
+```bash
+# 1. สร้าง standalone Pod
+cat > standalone.yaml << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: standalone-nginx
+  labels:
+    app: adopted-app
+    env: dev
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.21
+EOF
+kubectl apply -f standalone.yaml
+
+# 2. รอให้ Pod running
+kubectl wait --for=condition=ready pod/standalone-nginx
+
+# 3. สร้าง ReplicaSet ที่ selector match
+cat > adopting-rs.yaml << 'EOF'
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: adopting-rs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: adopted-app
+  template:
+    metadata:
+      labels:
+        app: adopted-app
+        env: dev
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21
+EOF
+kubectl apply -f adopting-rs.yaml
+
+# 4. สังเกตผลลัพธ์ - RS ควร create เพียง 2 Pods ใหม่ (ไม่ใช่ 3)
+kubectl get pods -l app=adopted-app
+
+# 5. ยืนยันว่า standalone-nginx ถูก adopt
+kubectl get pod standalone-nginx -o yaml | grep -A5 ownerReferences
+```
+
+---
+
+### แบบฝึกหัดที่ 6: ลบ ReplicaSet แบบ Orphan
+
+**โจทย์**: ลบ ReplicaSet โดยไม่ลบ Pods ที่มันจัดการ
+
+**เฉลย**:
+```bash
+# ลบ RS แบบ orphan (Pods จะไม่ถูกลบ)
+kubectl delete rs web-rs --cascade=orphan
+
+# ตรวจสอบว่า RS ถูกลบแล้ว
+kubectl get rs
+
+# ตรวจสอบว่า Pods ยังอยู่ (แต่ไม่มี owner แล้ว)
+kubectl get pods -l app=web
+
+# ดู ownerReferences ที่หายไป
+kubectl get pod <pod-name> -o yaml | grep ownerReferences
+# ควรเป็น ownerReferences: null หรือไม่มี field นี้
+```
+
+---
+
+### แบบฝึกหัดที่ 7: HPA กับ ReplicaSet
+
+**โจทย์**: ตั้ง HPA สำหรับ ReplicaSet
+
+**เฉลย**:
+```bash
+# สร้าง ReplicaSet ก่อน
+kubectl apply -f web-rs.yaml
+
+# สร้าง HPA สำหรับ RS
+kubectl autoscale rs web-rs \
+    --min=2 \
+    --max=10 \
+    --cpu-percent=70
+
+# ดู HPA
+kubectl get hpa web-rs
+
+# ดูรายละเอียด
+kubectl describe hpa web-rs
+```
+
+```yaml
+# หรือสร้าง HPA ด้วย YAML
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-rs-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: ReplicaSet
+    name: web-rs
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+---
+
+### แบบฝึกหัดที่ 8: Production-ready ReplicaSet
+
+**โจทย์**: สร้าง ReplicaSet แบบ production-ready ที่มี resource limits, probes, และ security context
+
+**เฉลย**:
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: production-rs
+  labels:
+    app: api-server
+    version: "2.0"
+    environment: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-server
+      environment: production
+  template:
+    metadata:
+      labels:
+        app: api-server
+        version: "2.0"
+        environment: production
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: api
+        image: myregistry/api-server:2.0
+        ports:
+        - containerPort: 8080
+          name: http
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          successThreshold: 1
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsUser: 1000
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: api-server
+              topologyKey: kubernetes.io/hostname
+```
+
+---
+
+### แบบฝึกหัดที่ 9: Debugging ReplicaSet ที่ไม่ Scale
+
+**โจทย์**: ระบุและแก้ไขปัญหาทำไม ReplicaSet จึงไม่ scale
+
+```bash
+# สร้าง RS ที่มีปัญหา (image ไม่ถูกต้อง)
+cat > broken-rs.yaml << 'EOF'
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: broken-rs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: broken
+  template:
+    metadata:
+      labels:
+        app: broken
+    spec:
+      containers:
+      - name: app
+        image: nonexistent-registry/no-such-image:latest
+EOF
+kubectl apply -f broken-rs.yaml
+```
+
+**เฉลย - ขั้นตอน Debugging**:
+```bash
+# ขั้นที่ 1: ดู RS status
+kubectl get rs broken-rs
+# จะเห็น READY=0
+
+# ขั้นที่ 2: ดู Pod status
+kubectl get pods -l app=broken
+# จะเห็น ImagePullBackOff หรือ ErrImagePull
+
+# ขั้นที่ 3: ดูรายละเอียด Pod
+kubectl describe pod <broken-pod-name>
+# ดู Events section - จะเห็น Failed to pull image
+
+# ขั้นที่ 4: แก้ไข image
+kubectl set image rs/broken-rs app=nginx:1.21
+
+# ขั้นที่ 5: ตรวจสอบ (RS ไม่ restart Pods อัตโนมัติ)
+# ต้องลบ Pods เก่าด้วยตนเอง
+kubectl delete pods -l app=broken
+
+# ขั้นที่ 6: ยืนยันว่า RS scale ได้แล้ว
+kubectl get pods -l app=broken
+```
+
+---
+
+### แบบฝึกหัดที่ 10: เปรียบเทียบ ReplicaSet กับ Deployment
+
+**โจทย์**: เข้าใจความแตกต่างระหว่าง ReplicaSet และ Deployment โดยทดลอง update image
+
+**เฉลย**:
+
+```bash
+# สร้าง ReplicaSet
+cat > compare-rs.yaml << 'EOF'
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: compare-rs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: compare
+  template:
+    metadata:
+      labels:
+        app: compare
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+EOF
+kubectl apply -f compare-rs.yaml
+
+# พยายาม update image
+kubectl set image rs/compare-rs nginx=nginx:1.21
+
+# ตรวจสอบ: RS ไม่ restart Pods ที่มีอยู่!
+kubectl get pods -l app=compare -o jsonpath='{.items[*].spec.containers[0].image}'
+# จะยังเห็น nginx:1.20 ใน Pods ที่มีอยู่
+
+# Pods ใหม่เท่านั้นที่จะใช้ image ใหม่
+kubectl delete pod <one-pod-name>
+kubectl get pods -l app=compare -o jsonpath='{.items[*].spec.containers[0].image}'
+# Pod ใหม่จะใช้ nginx:1.21 แต่ Pods เก่ายังคง 1.20
+```
+
+```bash
+# เปรียบเทียบกับ Deployment
+cat > compare-deploy.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compare-deploy
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: compare-deploy
+  template:
+    metadata:
+      labels:
+        app: compare-deploy
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+EOF
+kubectl apply -f compare-deploy.yaml
+
+# Update image ใน Deployment
+kubectl set image deployment/compare-deploy nginx=nginx:1.21
+
+# Deployment จะ Rolling Update ทุก Pod อัตโนมัติ!
+kubectl rollout status deployment/compare-deploy
+kubectl get pods -l app=compare-deploy \
+    -o jsonpath='{.items[*].spec.containers[0].image}'
+# จะเห็น nginx:1.21 ทุกตัว
+```
+
+**ข้อสรุป**: 
+- ReplicaSet: ไม่ update Pods ที่มีอยู่เมื่อเปลี่ยน template
+- Deployment: จัดการ Rolling Update ให้อัตโนมัติ ผ่านการสร้าง ReplicaSet ใหม่
+
+---
+
+## สรุปทบทวน ReplicaSets
+
+### Cheat Sheet
+
+```bash
+# สร้าง/อัพเดต
+kubectl apply -f replicaset.yaml
+
+# ดูรายการ
+kubectl get rs
+kubectl get rs -n <namespace>
+
+# ดูรายละเอียด
+kubectl describe rs <name>
+
+# Scale
+kubectl scale rs <name> --replicas=<count>
+
+# Edit
+kubectl edit rs <name>
+
+# ลบ (พร้อม Pods)
+kubectl delete rs <name>
+
+# ลบ (ไม่ลบ Pods)
+kubectl delete rs <name> --cascade=orphan
+
+# ดู Pods ของ RS
+kubectl get pods -l <selector>
+```
+
+ReplicaSet เป็นรากฐานของ Deployment ที่ใช้งานจริงใน Production ความเข้าใจ ReplicaSet จะช่วยให้ Debug Deployment ได้ง่ายขึ้น

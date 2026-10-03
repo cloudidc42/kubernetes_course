@@ -945,3 +945,772 @@ Labels และ Selectors เป็น core concept ของ Kubernetes ที
 - Labels สำหรับ select, Annotations สำหรับ metadata
 
 ในบทต่อไปเราจะเรียนรู้ **Annotations** ซึ่งเป็น metadata ที่เก็บข้อมูลเพิ่มเติมที่ไม่ได้ใช้สำหรับ select
+
+---
+
+## Recommended Label Schema (app.kubernetes.io/*)
+
+### มาตรฐาน Kubernetes Labels
+
+Kubernetes แนะนำ labels ชุด `app.kubernetes.io/*` สำหรับ best practices ใน production
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-application
+  labels:
+    app.kubernetes.io/name: my-application
+    app.kubernetes.io/instance: my-application-prod
+    app.kubernetes.io/version: "1.5.2"
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: my-platform
+    app.kubernetes.io/managed-by: helm
+    app.kubernetes.io/created-by: "team-frontend"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: my-application
+      app.kubernetes.io/instance: my-application-prod
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: my-application
+        app.kubernetes.io/instance: my-application-prod
+        app.kubernetes.io/version: "1.5.2"
+        app.kubernetes.io/component: frontend
+    spec:
+      containers:
+      - name: app
+        image: my-application:1.5.2
+```
+
+### ความหมายของแต่ละ Label
+
+| Label Key | ตัวอย่างค่า | ความหมาย |
+|-----------|------------|-----------|
+| `app.kubernetes.io/name` | `my-app` | ชื่อ application |
+| `app.kubernetes.io/instance` | `my-app-prod` | instance ที่เฉพาะเจาะจง |
+| `app.kubernetes.io/version` | `1.2.3` | version ของ application |
+| `app.kubernetes.io/component` | `frontend`, `backend`, `database` | component ใน architecture |
+| `app.kubernetes.io/part-of` | `ecommerce-platform` | application หลักที่เป็นส่วนหนึ่ง |
+| `app.kubernetes.io/managed-by` | `helm`, `kubectl`, `argocd` | เครื่องมือที่ manage |
+| `app.kubernetes.io/created-by` | `team-frontend` | ทีมที่สร้าง |
+
+### ตัวอย่าง Microservices ที่ใช้ Standard Labels
+
+```yaml
+# Payment Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/instance: payment-service-production
+    app.kubernetes.io/version: "3.1.0"
+    app.kubernetes.io/component: payment
+    app.kubernetes.io/part-of: ecommerce-platform
+    app.kubernetes.io/managed-by: argocd
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+      app.kubernetes.io/instance: payment-service-production
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-service
+        app.kubernetes.io/instance: payment-service-production
+        app.kubernetes.io/version: "3.1.0"
+    spec:
+      containers:
+      - name: payment
+        image: payment-service:3.1.0
+---
+# User Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  labels:
+    app.kubernetes.io/name: user-service
+    app.kubernetes.io/instance: user-service-production
+    app.kubernetes.io/version: "2.0.1"
+    app.kubernetes.io/component: user-management
+    app.kubernetes.io/part-of: ecommerce-platform
+    app.kubernetes.io/managed-by: argocd
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: user-service
+      app.kubernetes.io/instance: user-service-production
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: user-service
+        app.kubernetes.io/instance: user-service-production
+        app.kubernetes.io/version: "2.0.1"
+    spec:
+      containers:
+      - name: user
+        image: user-service:2.0.1
+```
+
+---
+
+## Labels สำหรับ Cost Allocation
+
+### ความสำคัญของ Cost Labels
+
+ในองค์กรขนาดใหญ่ Labels ใช้สำหรับ:
+- ติดตามค่าใช้จ่ายต่อทีม/โปรเจกต์
+- Chargeback ไปยังแต่ละ Business Unit
+- Optimize การใช้ Resources
+- Budget Planning
+
+### Schema สำหรับ Cost Allocation
+
+```yaml
+# Pod ที่มี cost allocation labels ครบ
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-server
+  labels:
+    # Cost Allocation Labels
+    cost-center: "CC-1234"           # รหัส cost center
+    business-unit: "payments"         # business unit
+    team: "backend-team"              # ทีมที่รับผิดชอบ
+    project: "project-phoenix"        # โปรเจกต์
+    environment: "production"         # environment
+    # Application Labels
+    app: "api-server"
+    version: "2.1.0"
+    # Billing Labels
+    billing-category: "compute"
+    owner-email: "backend@company.com"
+spec:
+  containers:
+  - name: api
+    image: api-server:2.1.0
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+```
+
+### ใช้ Labels กับ Kubecost หรือ OpenCost
+
+```bash
+# ดู cost ต่อทีม (ต้องติดตั้ง Kubecost)
+kubectl cost namespace \
+    --historical \
+    --window 7d \
+    -l team=backend-team
+
+# ดู cost ต่อ business unit
+kubectl cost namespace \
+    --historical \
+    -l business-unit=payments
+
+# ดู cost สรุปทั้งหมด
+kubectl cost deployment \
+    --all-namespaces \
+    -l cost-center=CC-1234
+```
+
+### Script คำนวณ Cost Estimate
+
+```bash
+#!/bin/bash
+# estimate-cost.sh - ประมาณค่าใช้จ่ายจาก resource requests
+
+TEAM="${1:-backend-team}"
+
+echo "Cost Estimate for Team: $TEAM"
+echo "================================"
+
+# ดู CPU requests รวม (หน่วย millicores)
+CPU_TOTAL=$(kubectl get pods \
+    --all-namespaces \
+    -l "team=$TEAM" \
+    -o jsonpath='{range .items[*]}{.spec.containers[*].resources.requests.cpu}{"\n"}{end}' | \
+    sed 's/m//' | \
+    awk '{sum += $1} END {print sum}')
+
+# ดู Memory requests รวม (หน่วย Mi)
+MEM_TOTAL=$(kubectl get pods \
+    --all-namespaces \
+    -l "team=$TEAM" \
+    -o jsonpath='{range .items[*]}{.spec.containers[*].resources.requests.memory}{"\n"}{end}' | \
+    sed 's/Mi//' | \
+    awk '{sum += $1} END {print sum}')
+
+echo "Total CPU Requests: ${CPU_TOTAL}m ($(echo "scale=2; $CPU_TOTAL/1000" | bc) cores)"
+echo "Total Memory Requests: ${MEM_TOTAL}Mi ($(echo "scale=2; $MEM_TOTAL/1024" | bc) Gi)"
+
+# ราคาประมาณ (สมมติ $0.048/core/hour และ $0.006/Gi/hour)
+CPU_COST=$(echo "scale=4; $CPU_TOTAL/1000 * 0.048 * 24 * 30" | bc)
+MEM_COST=$(echo "scale=4; $MEM_TOTAL/1024 * 0.006 * 24 * 30" | bc)
+TOTAL=$(echo "scale=2; $CPU_COST + $MEM_COST" | bc)
+
+echo "Estimated Monthly Cost: \$$TOTAL"
+```
+
+---
+
+## Advanced Selector Examples
+
+### Multiple Label Conditions
+
+```bash
+# Pods ที่มี app=nginx AND environment=production
+kubectl get pods -l "app=nginx,environment=production"
+
+# Pods ที่ version เป็น 1.0 หรือ 2.0 แต่ไม่ใช่ deprecated
+kubectl get pods -l 'version in (1.0, 2.0),status notin (deprecated)'
+
+# Pods ที่มี label 'team' อยู่ และ environment ไม่ใช่ test
+kubectl get pods -l 'team,environment!=test'
+
+# เลือก Nodes ที่ เป็น worker แต่ไม่ใช่ gpu node
+kubectl get nodes -l 'role=worker,!gpu'
+```
+
+### Selector ใน kubectl
+
+```bash
+# ดู Deployments พร้อม Labels ที่ต้องการ
+kubectl get deployments \
+    -l "app.kubernetes.io/part-of=ecommerce-platform" \
+    --all-namespaces
+
+# ดู Resources หลายประเภทพร้อมกัน
+kubectl get pods,services,deployments \
+    -l app=my-app \
+    -n production
+
+# Count resources ต่อ label value
+kubectl get pods --all-namespaces \
+    --selector='environment=production' \
+    -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" | \
+    wc -l
+```
+
+### Selector ใน Service
+
+```yaml
+# Service ที่เลือก Pods หลายเวอร์ชันในช่วง Canary Deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  # ใช้ selector ที่กว้างพอสำหรับทุก version
+  selector:
+    app: my-app
+    environment: production
+    # ไม่ระบุ version - รับทั้ง stable และ canary
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+```yaml
+# Service แยกสำหรับ version เฉพาะเจาะจง
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service-v2
+spec:
+  selector:
+    app: my-app
+    version: "2.0"
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+### Field Selectors (ไม่ใช่ Label แต่เกี่ยวข้อง)
+
+```bash
+# เลือก Pods ตาม status.phase
+kubectl get pods --field-selector status.phase=Running
+kubectl get pods --field-selector status.phase=Pending
+
+# เลือก Pods ที่รันบน node เฉพาะ
+kubectl get pods \
+    --field-selector spec.nodeName=node-01
+
+# รวม field selector กับ label selector
+kubectl get pods \
+    --field-selector status.phase=Running \
+    -l app=my-app
+
+# ดู Events ของ resource เฉพาะ
+kubectl get events \
+    --field-selector "involvedObject.name=my-pod,type=Warning"
+```
+
+---
+
+## Labels ใน kubectl Output
+
+### แสดง Labels เป็น Columns
+
+```bash
+# แสดง labels ทั้งหมด
+kubectl get pods --show-labels
+
+# แสดง labels เฉพาะที่ต้องการเป็น columns
+kubectl get pods -L app,version,environment
+
+# Output ตัวอย่าง:
+# NAME              READY   STATUS    APP      VERSION   ENVIRONMENT
+# api-pod-abc123    1/1     Running   my-api   1.5.0     production
+# api-pod-def456    1/1     Running   my-api   1.5.0     production
+# api-pod-xyz789    1/1     Running   my-api   1.5.0     staging
+
+# แสดงหลาย resource types พร้อม labels
+kubectl get pods,services -L app,environment -n production
+```
+
+### Custom Columns Output
+
+```bash
+# แสดงข้อมูล custom ด้วย labels
+kubectl get pods \
+    -o custom-columns=\
+"NAME:.metadata.name,\
+APP:.metadata.labels.app,\
+VERSION:.metadata.labels.version,\
+ENV:.metadata.labels.environment,\
+NODE:.spec.nodeName" \
+    --all-namespaces
+
+# Export เป็น CSV สำหรับวิเคราะห์
+kubectl get pods \
+    --all-namespaces \
+    -o custom-columns=\
+"NAMESPACE:.metadata.namespace,\
+NAME:.metadata.name,\
+APP:.metadata.labels.app,\
+TEAM:.metadata.labels.team" \
+    | tail -n +2 | tr -s ' ' ',' > pods-labels.csv
+```
+
+### JSONPath สำหรับดู Labels
+
+```bash
+# ดู label เฉพาะตัวของ resource
+kubectl get pod my-pod \
+    -o jsonpath='{.metadata.labels.app}'
+
+# ดูทุก labels ของ Pods ทั้งหมด
+kubectl get pods \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels}{"\n"}{end}'
+
+# หา Pods ที่ไม่มี label 'version'
+kubectl get pods -o json | \
+    jq -r '.items[] | select(.metadata.labels.version == null) | .metadata.name'
+```
+
+---
+
+## Workshop: Label-based Management
+
+### ภาพรวม Workshop
+
+Workshop นี้จะจัดการ microservices หลายตัวด้วย Labels:
+1. Deploy หลาย services ด้วย standard labels
+2. ทดสอบ Blue-Green deployment ด้วย Labels
+3. ใช้ Labels สำหรับ monitoring queries
+
+### ขั้นตอนที่ 1: Deploy Microservices
+
+```bash
+cat > microservices.yaml << 'EOF'
+# API Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  labels:
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/part-of: ecommerce
+    app.kubernetes.io/component: gateway
+    team: platform
+    environment: staging
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api-gateway
+        app.kubernetes.io/part-of: ecommerce
+        team: platform
+        environment: staging
+        version: "1.0"
+    spec:
+      containers:
+      - name: gateway
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+---
+# Product Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+  labels:
+    app.kubernetes.io/name: product-service
+    app.kubernetes.io/part-of: ecommerce
+    app.kubernetes.io/component: products
+    team: backend
+    environment: staging
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: product-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: product-service
+        app.kubernetes.io/part-of: ecommerce
+        team: backend
+        environment: staging
+        version: "2.1"
+    spec:
+      containers:
+      - name: product
+        image: nginx:1.21
+        ports:
+        - containerPort: 8080
+---
+# Order Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  labels:
+    app.kubernetes.io/name: order-service
+    app.kubernetes.io/part-of: ecommerce
+    app.kubernetes.io/component: orders
+    team: backend
+    environment: staging
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: order-service
+        app.kubernetes.io/part-of: ecommerce
+        team: backend
+        environment: staging
+        version: "1.5"
+    spec:
+      containers:
+      - name: order
+        image: nginx:1.21
+        ports:
+        - containerPort: 8080
+EOF
+
+kubectl apply -f microservices.yaml
+kubectl get pods --show-labels
+```
+
+### ขั้นตอนที่ 2: Query ด้วย Labels
+
+```bash
+# ดู services ทั้งหมดของ ecommerce platform
+kubectl get all \
+    -l "app.kubernetes.io/part-of=ecommerce"
+
+# ดู backend team resources
+kubectl get deployments \
+    -l "team=backend"
+
+# ดู Pod counts ต่อ component
+for component in gateway products orders; do
+  count=$(kubectl get pods \
+      -l "app.kubernetes.io/part-of=ecommerce" \
+      --field-selector status.phase=Running | \
+      grep -c "$component" || echo 0)
+  echo "$component: $count running pods"
+done
+```
+
+### ขั้นตอนที่ 3: Blue-Green Deployment ด้วย Labels
+
+```bash
+# สร้าง Service ที่ชี้ไปหา "green" version
+cat > bg-service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service-svc
+spec:
+  selector:
+    app.kubernetes.io/name: product-service
+    slot: green              # ชี้ไปหา green
+  ports:
+  - port: 80
+    targetPort: 8080
+EOF
+kubectl apply -f bg-service.yaml
+
+# Label Pods เป็น green (current)
+kubectl label pods \
+    -l "app.kubernetes.io/name=product-service" \
+    slot=green
+
+# Deploy Blue version (ใหม่)
+cat > product-blue.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service-blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: product-service
+      slot: blue
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: product-service
+        slot: blue
+        version: "2.2"
+    spec:
+      containers:
+      - name: product
+        image: nginx:1.22  # new version
+        ports:
+        - containerPort: 8080
+EOF
+kubectl apply -f product-blue.yaml
+
+# รอ Blue version ready
+kubectl rollout status deployment/product-service-blue
+
+# Switch traffic ไปที่ Blue
+kubectl patch service product-service-svc \
+    -p '{"spec":{"selector":{"slot":"blue"}}}'
+
+# ตรวจสอบว่า traffic ไปที่ Blue แล้ว
+kubectl get service product-service-svc -o yaml | grep -A5 selector
+```
+
+### ขั้นตอนที่ 4: Cleanup ด้วย Labels
+
+```bash
+# ลบทุกอย่างใน staging environment
+kubectl delete all \
+    -l "environment=staging"
+
+# ลบเฉพาะ backend team resources
+kubectl delete deployments \
+    -l "team=backend"
+
+# ลบทั้ง platform ในคราวเดียว
+kubectl delete all \
+    -l "app.kubernetes.io/part-of=ecommerce"
+```
+
+---
+
+## แบบฝึกหัด: Labels and Selectors
+
+### แบบฝึกหัดที่ 1: เพิ่ม Labels ให้ Resources ที่มีอยู่
+
+**โจทย์**: เพิ่ม label `monitored=true` ให้ Pods ทุกตัวที่รันอยู่ใน namespace default
+
+**เฉลย**:
+```bash
+# ดู Pods ที่มี
+kubectl get pods
+
+# เพิ่ม label ทุก Pods
+kubectl label pods --all monitored=true
+
+# ตรวจสอบ
+kubectl get pods --show-labels | grep monitored
+
+# เพิ่ม label เฉพาะ Pods ที่ running
+kubectl get pods --field-selector status.phase=Running \
+    -o name | xargs kubectl label monitored=true
+```
+
+---
+
+### แบบฝึกหัดที่ 2: ใช้ Set-based Selector
+
+**โจทย์**: แสดง Pods ทั้งหมดที่ environment เป็น `staging` หรือ `development` แต่ไม่ใช่ `deprecated`
+
+**เฉลย**:
+```bash
+# สร้าง Pods ทดสอบ
+kubectl run pod-staging \
+    --image=nginx \
+    --labels="app=test,environment=staging"
+kubectl run pod-dev \
+    --image=nginx \
+    --labels="app=test,environment=development"
+kubectl run pod-prod \
+    --image=nginx \
+    --labels="app=test,environment=production"
+kubectl run pod-deprecated \
+    --image=nginx \
+    --labels="app=test,environment=deprecated"
+
+# Query ด้วย set-based selector
+kubectl get pods \
+    -l 'environment in (staging, development)'
+
+# ผลลัพธ์ที่ถูกต้อง: จะเห็นเฉพาะ pod-staging และ pod-dev
+```
+
+---
+
+### แบบฝึกหัดที่ 3: NodeSelector
+
+**โจทย์**: กำหนดให้ Pod รันเฉพาะบน Nodes ที่มี SSD disk
+
+**เฉลย**:
+```bash
+# เพิ่ม label ให้ Node (ต้องเป็น admin)
+kubectl label node <node-name> disk-type=ssd
+
+# สร้าง Pod ที่ต้องการ SSD
+cat > ssd-pod.yaml << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ssd-workload
+spec:
+  nodeSelector:
+    disk-type: ssd
+  containers:
+  - name: app
+    image: nginx
+EOF
+kubectl apply -f ssd-pod.yaml
+
+# ตรวจสอบว่า Pod รันบน SSD node
+kubectl get pod ssd-workload -o wide
+kubectl describe pod ssd-workload | grep Node:
+```
+
+---
+
+### แบบฝึกหัดที่ 4: Service Selector
+
+**โจทย์**: สร้าง Service ที่รับ traffic เฉพาะจาก Pods ที่เป็น `ready=true` (simulated)
+
+**เฉลย**:
+```yaml
+# สร้าง Deployment พร้อม labels
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+        traffic: enabled
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.21
+---
+# Service เลือก Pods ที่ traffic=enabled เท่านั้น
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app-svc
+spec:
+  selector:
+    app: my-app
+    traffic: enabled
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+```bash
+# ทดสอบโดย disable traffic บาง Pod
+kubectl label pod <pod-name> traffic=disabled --overwrite
+# Pod นั้นจะถูกถอดออกจาก Service endpoints
+
+# ดู endpoints
+kubectl get endpoints my-app-svc
+```
+
+---
+
+### แบบฝึกหัดที่ 5: ลบ Label
+
+**โจทย์**: ลบ label `monitored` ออกจาก Pod เฉพาะตัว และ `environment` จากทุก Pods
+
+**เฉลย**:
+```bash
+# ลบ label จาก Pod เฉพาะตัว (ใส่ - ท้ายชื่อ label)
+kubectl label pod my-pod monitored-
+
+# ลบ label จากทุก Pods
+kubectl label pods --all environment-
+
+# ยืนยันว่าถูกลบแล้ว
+kubectl get pods --show-labels
+```
+
+---
+
+## สรุปทบทวน Labels and Selectors
+
+### Cheat Sheet
+
+```bash
+# เพิ่ม/แก้ไข label
+kubectl label <resource> <name> key=value
+kubectl label <resource> <name> key=value --overwrite
+
+# ลบ label
+kubectl label <resource> <name> key-
+
+# เพิ่ม label ทุก resources
+kubectl label <resource> --all key=value
+
+# Query ด้วย selector
+kubectl get pods -l key=value
+kubectl get pods -l 'key in (v1,v2)'
+kubectl get pods -l 'key notin (v1,v2)'
+kubectl get pods -l key          # has label
+kubectl get pods -l '!key'       # not has label
+
+# แสดง labels
+kubectl get pods --show-labels
+kubectl get pods -L key1,key2    # แสดงเป็น columns
+```
+
+Labels เป็น core mechanism ที่ทุก Kubernetes component ใช้ในการ identify และ group resources การเข้าใจ Labels อย่างถ่องแท้จะช่วยให้จัดการ cluster ขนาดใหญ่ได้อย่างมีประสิทธิภาพ

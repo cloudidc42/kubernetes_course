@@ -756,3 +756,1485 @@ Kubernetes คือ Platform ที่ช่วยให้การ Deploy แ
 ---
 
 *ต่อไป: [Part 02: Container Orchestration](./part-02-container-orchestration.md)*
+
+---
+
+## Kubernetes vs Traditional VMs - เปรียบเทียบเชิงลึก
+
+### ตาราง Feature Comparison
+
+| คุณสมบัติ | Traditional VMs | Docker Containers | Kubernetes |
+|-----------|----------------|-------------------|------------|
+| Startup Time | 1-5 นาที | 1-30 วินาที | 5-60 วินาที (Pod) |
+| Size | GB ต่อ VM | MB ต่อ Image | MB (Container) |
+| Isolation | Full OS Isolation | Process Isolation | Namespace Isolation |
+| Resource Usage | สูง (Full OS) | ต่ำ (Shared Kernel) | ต่ำมาก (Optimized) |
+| Portability | ต่ำ (Image ใหญ่) | สูง (Lightweight) | สูงมาก (Platform Independent) |
+| Scaling | ช้า (ต้อง Clone VM) | เร็ว (ไม่กี่วินาที) | อัตโนมัติ (HPA) |
+| Self-healing | Manual | Manual | อัตโนมัติ |
+| Load Balancing | ต้องตั้งค่าเอง | ต้องตั้งค่าเอง | Built-in |
+| Service Discovery | ต้องตั้งค่าเอง | ต้องตั้งค่าเอง | Built-in (DNS) |
+| Rolling Updates | ยุ่งยาก | ปานกลาง | อัตโนมัติ Zero-downtime |
+| Rollback | ยากมาก | ปานกลาง | ง่าย (kubectl rollout undo) |
+| Storage Management | Manual | Volumes | Persistent Volumes |
+| Secret Management | Manual | Environment Vars | Secrets Object |
+| Config Management | Manual | Environment Vars | ConfigMaps |
+| Network Policy | OS Firewall | Docker Networks | NetworkPolicy |
+| Multi-tenant | VMs แยก | Namespaces พื้นฐาน | Namespaces + RBAC |
+| HA & Failover | ต้องตั้งค่า | ต้องตั้งค่า | Built-in (Node HA) |
+| Cost | สูง | ปานกลาง | ต่ำสุด (Resource Efficiency) |
+| Learning Curve | ต่ำ | ปานกลาง | สูง |
+
+### เปรียบเทียบ Resource Overhead
+
+```
+Traditional VM Stack:
+┌─────────────────────────────────────────────────────┐
+│  Application (100MB)                                 │
+├─────────────────────────────────────────────────────┤
+│  Runtime (200MB)                                     │
+├─────────────────────────────────────────────────────┤
+│  Guest OS (2,000MB)  ← ใช้ Memory มาก!             │
+├─────────────────────────────────────────────────────┤
+│  Virtual Hardware                                    │
+├─────────────────────────────────────────────────────┤
+│  Hypervisor (500MB)                                  │
+├─────────────────────────────────────────────────────┤
+│  Host OS (1,000MB)                                   │
+├─────────────────────────────────────────────────────┤
+│  Physical Hardware                                   │
+└─────────────────────────────────────────────────────┘
+Total Overhead per App: ~3.8 GB
+
+Container Stack (Kubernetes):
+┌─────────────────────────────────────────────────────┐
+│  Application (100MB)                                 │
+├─────────────────────────────────────────────────────┤
+│  Runtime (200MB)                                     │
+├─────────────────────────────────────────────────────┤
+│  Container Image Layers (100MB shared)               │
+├─────────────────────────────────────────────────────┤
+│  Docker/containerd (50MB)                            │
+├─────────────────────────────────────────────────────┤
+│  Host OS (1,000MB) ← ใช้ร่วมกันทุก Container       │
+├─────────────────────────────────────────────────────┤
+│  Physical Hardware                                   │
+└─────────────────────────────────────────────────────┘
+Total Overhead per App: ~450MB (ประหยัดถึง 8x!)
+```
+
+### เปรียบเทียบการ Scale
+
+```
+Scenario: ต้องการเพิ่มจาก 2 → 10 instances
+
+Traditional VM Scaling (10-20 นาที):
+[VM1] [VM2]
+  ↓ clone
+[VM1] [VM2] [VM3..VM10] ← ต้องรอ Clone + Boot OS
+
+Container Scaling (30 วินาที):
+[Pod1] [Pod2]
+  ↓ kubectl scale --replicas=10
+[Pod1] [Pod2] [Pod3] [Pod4] [Pod5] [Pod6] [Pod7] [Pod8] [Pod9] [Pod10]
+  ← แค่ Pull Image แล้ว Start Process!
+```
+
+### เปรียบเทียบ CI/CD Pipeline
+
+| ขั้นตอน | Traditional VM | Kubernetes |
+|---------|----------------|------------|
+| Build | Build Application | Build Docker Image |
+| Test | Deploy to Test Server | Deploy to Test Namespace |
+| Package | Zip/Tar Binary | Push to Registry |
+| Deploy | SSH + Copy Files | kubectl apply |
+| Verify | Manual Check | Readiness Probe |
+| Rollback | Restore Backup (ชั่วโมง) | kubectl rollout undo (วินาที) |
+
+---
+
+## Real-world Case Studies
+
+### Netflix บน Kubernetes
+
+Netflix เป็นหนึ่งในองค์กรแรกๆ ที่นำ Kubernetes มาใช้ในระดับ Production ขนาดใหญ่
+
+**ข้อมูล Infrastructure ของ Netflix:**
+- จำนวน Microservices: มากกว่า 500 services
+- จำนวน Requests ต่อวัน: มากกว่า 1 พันล้าน requests
+- จำนวน Kubernetes Clusters: หลายร้อย clusters
+- จำนวน Containers ที่รันพร้อมกัน: หลักล้าน containers
+
+**ปัญหาที่ Netflix เผชิญก่อนใช้ Kubernetes:**
+
+```
+Before Kubernetes (2013-2016):
+┌─────────────────────────────────────────────────────────────────┐
+│  ปัญหา:                                                          │
+│  1. Monolithic Application ยากต่อการ Scale                      │
+│  2. Deployment ใช้เวลานาน (hours → days)                        │
+│  3. ทีมต่างๆ ต้อง Coordinate การ Deploy                         │
+│  4. Resource Utilization ต่ำมาก (~30%)                          │
+│  5. เมื่อ Traffic พุ่งสูงในช่วง Peak (เย็นวันศุกร์)            │
+│     ระบบมักล่ม หรือตอบสนองช้า                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+After Kubernetes (2017-ปัจจุบัน):
+┌─────────────────────────────────────────────────────────────────┐
+│  ผลลัพธ์:                                                        │
+│  1. Deployment ลดจาก hours เหลือ minutes                        │
+│  2. Resource Utilization เพิ่มขึ้นเป็น 70%+                    │
+│  3. Auto-scaling รับมือ Traffic Spike อัตโนมัติ                │
+│  4. Self-healing ลด Manual Intervention 90%                      │
+│  5. Engineer สามารถ Deploy ได้ตลอด 24 ชั่วโมง โดยไม่กลัว      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Netflix Titus - Custom Kubernetes Platform:**
+
+Netflix พัฒนา Titus ซึ่งเป็น Container Management System ที่สร้างบน Kubernetes โดยมีคุณสมบัติพิเศษ:
+
+```yaml
+# ตัวอย่าง Job Specification ของ Netflix Titus
+{
+  "applicationName": "video-transcoding-job",
+  "resources": {
+    "cpu": 4,
+    "memoryMB": 4096,
+    "diskMB": 10000,
+    "networkMbps": 128,
+    "gpu": 1  # ← Netflix ใช้ GPU สำหรับ Video Processing
+  },
+  "container": {
+    "image": {
+      "name": "netflix/transcoder",
+      "tag": "v2.3.1"
+    },
+    "env": {
+      "QUALITY": "4K",
+      "OUTPUT_FORMAT": "DASH"
+    }
+  },
+  "batch": {
+    "size": 1,
+    "retries": 3
+  }
+}
+```
+
+**สิ่งที่ Netflix เรียนรู้:**
+1. **Chaos Engineering**: ใช้ Chaos Monkey ทดสอบความทนทานของ Kubernetes Cluster
+2. **Multi-region**: Deploy บน AWS หลาย Region เพื่อ HA
+3. **Canary Deployment**: ทดสอบ Feature ใหม่กับ User กลุ่มเล็กก่อน
+
+---
+
+### Airbnb บน Kubernetes
+
+Airbnb ย้ายระบบทั้งหมดมาบน Kubernetes เพื่อแก้ปัญหา Monolith ขนาดใหญ่
+
+**จุดเริ่มต้น - Monolith ปัญหา:**
+
+```
+Airbnb Monolith (2014):
+┌─────────────────────────────────────────────────────────────────┐
+│                    Airbnb Monolith                               │
+│                                                                   │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐  │
+│  │  Search  │ │ Booking  │ │ Payment  │ │   Messaging      │  │
+│  │  Module  │ │  Module  │ │  Module  │ │   Module         │  │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘  │
+│                                                                   │
+│  ปัญหา: ทีม 100+ คน ทำงานบน Codebase เดียว                    │
+│  - Deploy ใหม่ต้อง Test ทั้งหมด                               │
+│  - Bug ในส่วนหนึ่งทำให้ทั้งระบบล่ม                           │
+│  - Scale ไม่ได้เลือกเฉพาะส่วนที่ต้องการ                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**การ Migrate ไปยัง Kubernetes:**
+
+```
+Phase 1 (2016-2017): Strangler Fig Pattern
+Monolith ──extract──► Search Service (Kubernetes)
+Monolith ──extract──► Pricing Service (Kubernetes)
+Monolith (ยังคงรัน)
+
+Phase 2 (2018-2019): Microservices Migration
+Monolith ──extract──► Booking Service (Kubernetes)
+Monolith ──extract──► Payment Service (Kubernetes)
+Monolith ──extract──► Review Service (Kubernetes)
+Monolith (เหลือแค่บางส่วน)
+
+Phase 3 (2020+): Full Kubernetes
+ทุก Service รันบน Kubernetes
+Monolith ถูก Decommission
+```
+
+**ผลลัพธ์ที่ Airbnb ได้รับ:**
+- Engineer Velocity เพิ่มขึ้น 3x (Deploy ได้บ่อยขึ้น)
+- Resource Cost ลดลง 40% จาก Better Resource Utilization
+- Deployment Frequency เพิ่มจาก 2 ครั้ง/สัปดาห์ เป็น 50+ ครั้ง/วัน
+- Mean Time to Recovery (MTTR) ลดจาก 2 ชั่วโมง เหลือ 10 นาที
+
+---
+
+### Spotify บน Kubernetes
+
+Spotify ใช้ Kubernetes เพื่อจัดการ Machine Learning Pipelines และ Microservices
+
+**Spotify Infrastructure ปัจจุบัน:**
+- 500+ Microservices บน Kubernetes
+- มากกว่า 300 Engineers ใช้ Kubernetes ทุกวัน
+- Deploy มากกว่า 200 ครั้งต่อวัน
+
+**Backstage - Developer Portal:**
+
+Spotify สร้าง Backstage ซึ่งปัจจุบันเป็น CNCF Project เพื่อแก้ปัญหา "Service Discovery สำหรับ Engineers":
+
+```
+ปัญหา: มี 500+ Services แล้วใครรู้ว่า Service ไหนทำอะไร?
+
+Backstage Solution:
+┌─────────────────────────────────────────────────────────────────┐
+│                     Backstage Portal                             │
+│                                                                   │
+│  Service Catalog:                                                 │
+│  ┌────────────────────┐  ┌────────────────────┐                │
+│  │ playlist-service   │  │ recommendation-svc  │                │
+│  │ Owner: Team Music  │  │ Owner: Team ML      │                │
+│  │ SLO: 99.9%         │  │ SLO: 99.5%          │                │
+│  │ Docs: /wiki/...    │  │ Docs: /wiki/...      │                │
+│  └────────────────────┘  └────────────────────┘                │
+│                                                                   │
+│  Tech Docs, API Docs, Ownership, On-call Info - ครบในที่เดียว  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Kubernetes + ML Pipelines:**
+
+```yaml
+# ตัวอย่าง Spotify ML Training Job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: recommendation-model-training
+  namespace: ml-platform
+spec:
+  template:
+    spec:
+      containers:
+      - name: trainer
+        image: spotify/ml-trainer:v3.2
+        resources:
+          requests:
+            memory: "16Gi"
+            cpu: "8"
+            nvidia.com/gpu: "2"
+          limits:
+            memory: "32Gi"
+            cpu: "16"
+            nvidia.com/gpu: "2"
+        env:
+        - name: TRAINING_DATA_PATH
+          value: "gs://spotify-ml-data/training/2024"
+        - name: MODEL_OUTPUT_PATH
+          value: "gs://spotify-models/recommendation/latest"
+        - name: EPOCHS
+          value: "100"
+      restartPolicy: OnFailure
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-tesla-a100
+```
+
+---
+
+## Kubernetes Roadmap 2024-2025
+
+### Kubernetes Release Cycle
+
+```
+Kubernetes Release Timeline:
+                                                          
+2024:
+  K8s 1.29 (Jan 2024) ─────► Stable
+  K8s 1.30 (Apr 2024) ─────► Stable  
+  K8s 1.31 (Aug 2024) ─────► Stable
+  K8s 1.32 (Dec 2024) ─────► Latest
+
+2025:
+  K8s 1.33 (Apr 2025) ─────► Planned
+  K8s 1.34 (Aug 2025) ─────► Planned
+  K8s 1.35 (Dec 2025) ─────► Planned
+
+รูปแบบ: 3 Releases ต่อปี (ทุก 4 เดือน)
+Support: แต่ละ Version ได้รับ Support 14 เดือน
+```
+
+### Features ที่น่าสนใจใน Kubernetes 1.29-1.32
+
+**Kubernetes 1.29 (Mandala):**
+
+```
+Feature Highlights:
+├── ReadWriteOncePod PV Access Mode - GA
+├── KMS v2 Encryption - GA
+├── Node Volume Expansion - GA  
+├── Pod Scheduling Readiness - GA
+└── Mixed Version Proxy - Alpha
+```
+
+**Kubernetes 1.30 (Uwubernetes):**
+
+```
+Feature Highlights:
+├── Structured Authentication Configuration - Beta
+├── Recursive Read-only Mounts - Beta
+├── Speed up recursive SELinux label change - GA
+├── Custom profiling in kubectl debug - Alpha
+└── Traffic Distribution for Services - Alpha
+```
+
+**Kubernetes 1.31 (Elli):**
+
+```
+Feature Highlights:
+├── AppArmor Support - GA
+├── Persistent Volume Last Phase Transition Time - GA
+├── Resource Health Status in Pod Status - Alpha
+├── Fine-grained SupplementalGroups control - Alpha
+└── Informer-based Watch Cache - Alpha
+```
+
+**Kubernetes 1.32 (Penelope):**
+
+```
+Feature Highlights:
+├── Multiple Service CIDRs - GA
+├── Asynchronous Preemption in Scheduler - Alpha
+├── DRA Structured Parameters - Beta
+├── Job API managed-by mechanism - GA
+└── OOMKill Policy for Sidecar Containers - Alpha
+```
+
+### Kubernetes Future Roadmap
+
+**Workload Management ปัจจุบันและอนาคต:**
+
+```
+Evolution of Kubernetes Workloads:
+
+2014-2016: Basic Workloads
+  ├── Pod (Basic unit)
+  ├── ReplicationController
+  └── Service
+
+2016-2018: Advanced Workloads
+  ├── Deployment
+  ├── DaemonSet  
+  ├── StatefulSet
+  ├── Job/CronJob
+  └── HPA (Horizontal Pod Autoscaler)
+
+2018-2022: Extended Capabilities
+  ├── Custom Resources (CRDs)
+  ├── Operators
+  ├── VPA (Vertical Pod Autoscaler)
+  └── KEDA (Event-driven Autoscaling)
+
+2022-2025: Next Generation
+  ├── Dynamic Resource Allocation (DRA) ← GPU, FPGA
+  ├── Sidecar Containers (Native)
+  ├── Job Success Policy
+  ├── Elastic Indexed Jobs
+  └── AI/ML Workload Optimizations
+```
+
+**AI/ML Integration - อนาคตของ Kubernetes:**
+
+```
+Kubernetes + AI/ML (2024-2025):
+
+1. GPU Resource Management
+   - Dynamic GPU Allocation ผ่าน DRA
+   - GPU Time-sharing
+   - MIG (Multi-Instance GPU) Support
+
+2. Large Model Training
+   - Distributed Training Operators (Kubeflow)
+   - Checkpointing Support
+   - Node Anti-affinity สำหรับ Training Jobs
+
+3. Inference Serving
+   - KServe (Model Serving Platform)
+   - Auto-scaling based on Model Latency
+   - A/B Testing สำหรับ Models
+
+ตัวอย่าง AI Workload บน Kubernetes:
+┌─────────────────────────────────────────────────────────────────┐
+│                     MLOps Pipeline on K8s                        │
+│                                                                   │
+│  Data Prep     Training        Evaluation       Serving          │
+│  ┌────────┐   ┌────────────┐  ┌────────────┐  ┌────────────┐  │
+│  │ Spark  │──►│  PyTorch   │─►│  Evaluate  │─►│  KServe    │  │
+│  │  Job   │   │  Training  │  │   Model    │  │  Serving   │  │
+│  │ (K8s)  │   │  (4x GPU)  │  │   (K8s)   │  │  (K8s)    │  │
+│  └────────┘   └────────────┘  └────────────┘  └────────────┘  │
+│                                                                   │
+│  Argo Workflows - Orchestration Engine                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Workshop ละเอียด: ติดตั้ง Minikube และ Deploy Node.js App
+
+### ขั้นตอนที่ 1: ติดตั้ง Minikube
+
+**สำหรับ Linux (Ubuntu/Debian):**
+
+```bash
+# 1. ดาวน์โหลด Minikube
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+
+# 2. ติดตั้ง
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+
+# 3. ตรวจสอบ Version
+minikube version
+# minikube version: v1.32.0
+
+# 4. ดาวน์โหลด kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# 5. ติดตั้ง kubectl
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# 6. ตรวจสอบ kubectl
+kubectl version --client
+```
+
+**สำหรับ macOS:**
+
+```bash
+# ใช้ Homebrew
+brew install minikube kubectl
+
+# หรือดาวน์โหลดโดยตรง
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-darwin-amd64
+sudo install minikube-darwin-amd64 /usr/local/bin/minikube
+```
+
+**สำหรับ Windows:**
+
+```powershell
+# ใช้ Chocolatey
+choco install minikube kubernetes-cli
+
+# หรือใช้ Winget
+winget install minikube
+winget install Kubernetes.kubectl
+```
+
+### ขั้นตอนที่ 2: เริ่มต้น Minikube Cluster
+
+```bash
+# เริ่ม Cluster พร้อมกำหนด Resources
+minikube start \
+  --cpus=4 \
+  --memory=8192 \
+  --disk-size=50g \
+  --driver=docker \
+  --kubernetes-version=v1.32.0
+
+# ตรวจสอบ Status
+minikube status
+# minikube
+# type: Control Plane
+# host: Running
+# kubelet: Running
+# apiserver: Running
+# kubeconfig: Configured
+
+# ดู Nodes
+kubectl get nodes
+# NAME       STATUS   ROLES           AGE   VERSION
+# minikube   Ready    control-plane   1m    v1.32.0
+
+# เปิด Dashboard (Optional)
+minikube dashboard
+```
+
+### ขั้นตอนที่ 3: สร้าง Node.js Application
+
+```bash
+# สร้าง Project Directory
+mkdir my-first-k8s-app
+cd my-first-k8s-app
+
+# สร้าง Node.js App
+cat > app.js << 'EOF'
+const http = require('http');
+const os = require('os');
+
+const PORT = process.env.PORT || 3000;
+const APP_VERSION = process.env.APP_VERSION || 'v1.0';
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'healthy', version: APP_VERSION }));
+    return;
+  }
+  
+  const hostname = os.hostname();
+  const response = {
+    message: `Hello from Kubernetes! 🎉`,
+    hostname: hostname,
+    version: APP_VERSION,
+    timestamp: new Date().toISOString(),
+    nodeVersion: process.version
+  };
+  
+  console.log(`Request received on ${hostname} at ${new Date().toISOString()}`);
+  
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(response, null, 2));
+});
+
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Hostname: ${os.hostname()}`);
+  console.log(`Version: ${APP_VERSION}`);
+});
+EOF
+
+# สร้าง package.json
+cat > package.json << 'EOF'
+{
+  "name": "my-k8s-app",
+  "version": "1.0.0",
+  "description": "My first Kubernetes App",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+EOF
+```
+
+### ขั้นตอนที่ 4: สร้าง Dockerfile
+
+```bash
+cat > Dockerfile << 'EOF'
+# Base Image
+FROM node:18-alpine
+
+# Set Working Directory
+WORKDIR /app
+
+# Copy package files first (สำหรับ Layer Caching)
+COPY package*.json ./
+
+# Install Dependencies
+RUN npm install --production
+
+# Copy Application Code
+COPY app.js .
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodeuser -u 1001 -G nodejs
+
+# Switch to non-root user
+USER nodeuser
+
+# Expose Port
+EXPOSE 3000
+
+# Health Check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+# Start Application
+CMD ["node", "app.js"]
+EOF
+
+# Build Image โดยใช้ Minikube's Docker daemon
+eval $(minikube docker-env)
+
+# Build Image
+docker build -t my-k8s-app:v1.0 .
+
+# ตรวจสอบ Image
+docker images | grep my-k8s-app
+```
+
+### ขั้นตอนที่ 5: สร้าง Kubernetes Manifests
+
+```bash
+# สร้าง Directory สำหรับ K8s Files
+mkdir k8s
+
+# สร้าง Deployment
+cat > k8s/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: default
+  labels:
+    app: my-app
+    version: v1.0
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: my-app
+        version: v1.0
+    spec:
+      containers:
+      - name: my-app
+        image: my-k8s-app:v1.0
+        imagePullPolicy: Never  # ใช้ Local Image
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: PORT
+          value: "3000"
+        - name: APP_VERSION
+          value: "v1.0"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+EOF
+
+# สร้าง Service
+cat > k8s/service.yaml << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app-service
+  namespace: default
+  labels:
+    app: my-app
+spec:
+  type: NodePort
+  selector:
+    app: my-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    nodePort: 30080
+EOF
+
+# สร้าง HPA (Horizontal Pod Autoscaler)
+cat > k8s/hpa.yaml << 'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+EOF
+```
+
+### ขั้นตอนที่ 6: Deploy ไปยัง Kubernetes
+
+```bash
+# Apply Manifests
+kubectl apply -f k8s/
+
+# ตรวจสอบ Deployment
+kubectl get deployments
+# NAME     READY   UP-TO-DATE   AVAILABLE   AGE
+# my-app   3/3     3            3           30s
+
+# ตรวจสอบ Pods
+kubectl get pods -o wide
+# NAME                      READY   STATUS    RESTARTS   AGE   IP           NODE
+# my-app-5d4b7f9c6-abc12    1/1     Running   0          30s   172.17.0.3   minikube
+# my-app-5d4b7f9c6-def34    1/1     Running   0          30s   172.17.0.4   minikube
+# my-app-5d4b7f9c6-ghi56    1/1     Running   0          30s   172.17.0.5   minikube
+
+# ตรวจสอบ Service
+kubectl get services
+# NAME             TYPE       CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+# my-app-service   NodePort   10.109.12.34    <none>        80:30080/TCP   30s
+
+# เข้าถึง Application
+curl $(minikube ip):30080
+# {
+#   "message": "Hello from Kubernetes! 🎉",
+#   "hostname": "my-app-5d4b7f9c6-abc12",
+#   "version": "v1.0",
+#   "timestamp": "2024-01-15T10:30:00.000Z",
+#   "nodeVersion": "v18.19.0"
+# }
+
+# เรียกซ้ำๆ เพื่อดู Load Balancing
+for i in {1..6}; do
+  curl -s $(minikube ip):30080 | python3 -m json.tool | grep hostname
+done
+# "hostname": "my-app-5d4b7f9c6-abc12"
+# "hostname": "my-app-5d4b7f9c6-def34"
+# "hostname": "my-app-5d4b7f9c6-ghi56"
+# "hostname": "my-app-5d4b7f9c6-abc12"
+# "hostname": "my-app-5d4b7f9c6-def34"
+# "hostname": "my-app-5d4b7f9c6-ghi56"
+# ← Load Balancing ทำงาน! แต่ละ Request ไปคนละ Pod
+```
+
+---
+
+## ทดสอบ Self-healing
+
+### การทดสอบ Pod Self-healing
+
+```bash
+# ดู Pods ปัจจุบัน
+kubectl get pods
+# NAME                      READY   STATUS    RESTARTS   AGE
+# my-app-5d4b7f9c6-abc12    1/1     Running   0          5m
+# my-app-5d4b7f9c6-def34    1/1     Running   0          5m
+# my-app-5d4b7f9c6-ghi56    1/1     Running   0          5m
+
+# ลบ Pod หนึ่งตัว (จำลองว่า Pod ล้มเหลว)
+kubectl delete pod my-app-5d4b7f9c6-abc12
+
+# ดู Pods ใหม่ทันที
+kubectl get pods
+# NAME                      READY   STATUS              RESTARTS   AGE
+# my-app-5d4b7f9c6-def34    1/1     Running             0          5m
+# my-app-5d4b7f9c6-ghi56    1/1     Running             0          5m
+# my-app-5d4b7f9c6-xyz99    0/1     ContainerCreating   0          2s  ← ใหม่!
+
+# รอสักครู่
+kubectl get pods
+# NAME                      READY   STATUS    RESTARTS   AGE
+# my-app-5d4b7f9c6-def34    1/1     Running   0          5m
+# my-app-5d4b7f9c6-ghi56    1/1     Running   0          5m
+# my-app-5d4b7f9c6-xyz99    1/1     Running   0          15s  ← Pod ใหม่พร้อมแล้ว!
+
+# Kubernetes สร้าง Pod ใหม่โดยอัตโนมัติ เพราะ Desired State = 3 Replicas
+```
+
+### การทดสอบ Node Failure Simulation
+
+```bash
+# ดู Nodes
+kubectl get nodes
+# NAME       STATUS   ROLES           AGE   VERSION
+# minikube   Ready    control-plane   10m   v1.32.0
+
+# ใน Production ถ้า Node ล้ม:
+# 1. Controller Manager ตรวจจับว่า Node ไม่ตอบสนอง
+# 2. Pods บน Node นั้นถูก Evict
+# 3. Pods ถูก Reschedule ไปยัง Node อื่น
+
+# จำลองด้วย Minikube (เพิ่ม Node ก่อน)
+minikube node add
+kubectl get nodes
+# NAME           STATUS   ROLES           AGE   VERSION
+# minikube       Ready    control-plane   15m   v1.32.0
+# minikube-m02   Ready    <none>          1m    v1.32.0
+
+# ลบ Node
+minikube node delete minikube-m02
+
+# ดู Pods ที่ถูก Reschedule
+kubectl get pods -o wide
+```
+
+### การทดสอบ Liveness Probe
+
+```bash
+# Deploy App ที่มี Liveness Probe ที่จำลองความล้มเหลว
+cat > k8s/test-liveness.yaml << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: liveness-test
+spec:
+  containers:
+  - name: app
+    image: busybox:1.35
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      touch /tmp/healthy
+      sleep 30
+      rm -f /tmp/healthy
+      sleep 600
+    livenessProbe:
+      exec:
+        command:
+        - cat
+        - /tmp/healthy
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 3
+EOF
+
+kubectl apply -f k8s/test-liveness.yaml
+
+# ดู Pod Status (หลัง 35 วินาที Probe จะ Fail)
+kubectl get pod liveness-test --watch
+# NAME             READY   STATUS    RESTARTS   AGE
+# liveness-test    1/1     Running   0          0s
+# liveness-test    1/1     Running   0          30s
+# liveness-test    0/1     Running   1          65s   ← Restart!
+# liveness-test    1/1     Running   1          67s   ← กลับมาแล้ว
+
+# ดู Events
+kubectl describe pod liveness-test | grep Events -A 20
+# Events:
+#   Type     Reason     Message
+#   ----     ------     -------
+#   Warning  Unhealthy  Liveness probe failed: cat: can't open '/tmp/healthy': No such file or directory
+#   Normal   Killing    Container liveness-test failed liveness probe, will be restarted
+
+# ลบ Pod ทดสอบ
+kubectl delete pod liveness-test
+```
+
+---
+
+## ทดสอบ Scaling
+
+### Manual Scaling
+
+```bash
+# ดู Deployment ปัจจุบัน
+kubectl get deployment my-app
+# NAME     READY   UP-TO-DATE   AVAILABLE   AGE
+# my-app   3/3     3            3           10m
+
+# Scale ขึ้นเป็น 6 Replicas
+kubectl scale deployment my-app --replicas=6
+
+# ดู Pods ใหม่
+kubectl get pods
+# NAME                      READY   STATUS              RESTARTS   AGE
+# my-app-5d4b7f9c6-abc12    1/1     Running             0          10m
+# my-app-5d4b7f9c6-def34    1/1     Running             0          10m
+# my-app-5d4b7f9c6-ghi56    1/1     Running             0          10m
+# my-app-5d4b7f9c6-jkl78    0/1     ContainerCreating   0          2s
+# my-app-5d4b7f9c6-mno90    0/1     ContainerCreating   0          2s
+# my-app-5d4b7f9c6-pqr12    0/1     ContainerCreating   0          2s
+
+# รอสักครู่
+kubectl get pods
+# ทั้ง 6 Pods Running แล้ว
+
+# Scale ลงเป็น 2 Replicas
+kubectl scale deployment my-app --replicas=2
+
+# ดู Pods ที่ถูกยกเลิก
+kubectl get pods
+# NAME                      READY   STATUS        RESTARTS   AGE
+# my-app-5d4b7f9c6-abc12    1/1     Running       0          12m
+# my-app-5d4b7f9c6-def34    1/1     Running       0          12m
+# my-app-5d4b7f9c6-ghi56    1/1     Terminating   0          12m  ← กำลังหยุด
+# my-app-5d4b7f9c6-jkl78    1/1     Terminating   0          2m   ← กำลังหยุด
+# ...
+```
+
+### Auto Scaling ด้วย HPA
+
+```bash
+# Apply HPA
+kubectl apply -f k8s/hpa.yaml
+
+# ดู HPA Status
+kubectl get hpa
+# NAME         REFERENCE           TARGETS          MINPODS   MAXPODS   REPLICAS
+# my-app-hpa   Deployment/my-app   2%/70%, 1%/80%   2         10        2
+
+# จำลอง Load (ต้อง Enable Metrics Server ก่อน)
+minikube addons enable metrics-server
+
+# สร้าง Load Test
+kubectl run load-test --image=busybox:1.35 --restart=Never -- \
+  sh -c "while true; do wget -q -O- http://my-app-service/; done"
+
+# ดู HPA ทำงาน
+kubectl get hpa --watch
+# NAME         REFERENCE           TARGETS           MINPODS   MAXPODS   REPLICAS
+# my-app-hpa   Deployment/my-app   2%/70%            2         10        2
+# my-app-hpa   Deployment/my-app   85%/70%           2         10        2
+# my-app-hpa   Deployment/my-app   85%/70%           2         10        4   ← Scale Up!
+# my-app-hpa   Deployment/my-app   70%/70%           2         10        4
+
+# หยุด Load Test
+kubectl delete pod load-test
+
+# ดู Scale Down (ใช้เวลาสักครู่)
+kubectl get hpa --watch
+# Replicas จะลดลงกลับมาเป็น 2
+```
+
+---
+
+## ทดสอบ Rolling Update
+
+### Update Application Version
+
+```bash
+# สร้าง Version 2 ของ App
+cat > app-v2.js << 'EOF'
+const http = require('http');
+const os = require('os');
+
+const PORT = process.env.PORT || 3000;
+const APP_VERSION = process.env.APP_VERSION || 'v2.0';
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'healthy', version: APP_VERSION }));
+    return;
+  }
+  
+  const hostname = os.hostname();
+  const response = {
+    message: `Hello from Kubernetes v2! 🚀 NEW FEATURE!`,
+    hostname: hostname,
+    version: APP_VERSION,
+    timestamp: new Date().toISOString(),
+    features: ['feature-1', 'feature-2', 'new-feature-3'],  // ← ฟีเจอร์ใหม่
+    nodeVersion: process.version
+  };
+  
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(response, null, 2));
+});
+
+server.listen(PORT, () => {
+  console.log(`Server v2 running on port ${PORT}`);
+});
+EOF
+
+cp app-v2.js app.js
+
+# Build Image Version 2
+docker build -t my-k8s-app:v2.0 .
+
+# ทำ Rolling Update
+kubectl set image deployment/my-app my-app=my-k8s-app:v2.0
+
+# ดู Rolling Update Process
+kubectl rollout status deployment/my-app
+# Waiting for deployment "my-app" rollout to finish: 1 out of 3 new replicas have been updated...
+# Waiting for deployment "my-app" rollout to finish: 2 out of 3 new replicas have been updated...
+# Waiting for deployment "my-app" rollout to finish: 1 old replicas are pending termination...
+# deployment "my-app" successfully rolled out
+
+# ดู Pods ระหว่าง Update (ใน Terminal อื่น)
+kubectl get pods --watch
+# NAME                      READY   STATUS              RESTARTS
+# my-app-5d4b7f9c6-abc12    1/1     Running             0  ← v1
+# my-app-5d4b7f9c6-def34    1/1     Running             0  ← v1  
+# my-app-5d4b7f9c6-ghi56    1/1     Running             0  ← v1
+# my-app-7e5c8g0d7-xxx11    0/1     ContainerCreating   0  ← v2 กำลังสร้าง
+# my-app-7e5c8g0d7-xxx11    1/1     Running             0  ← v2 พร้อมแล้ว
+# my-app-5d4b7f9c6-abc12    1/1     Terminating         0  ← v1 กำลังหยุด
+# ...
+
+# ดู Rollout History
+kubectl rollout history deployment/my-app
+# REVISION  CHANGE-CAUSE
+# 1         <none>
+# 2         <none>
+```
+
+### Rollback กลับ Version เดิม
+
+```bash
+# สมมติว่า v2 มี Bug - ต้อง Rollback
+kubectl rollout undo deployment/my-app
+
+# หรือ Rollback ไปยัง Revision ที่ระบุ
+kubectl rollout undo deployment/my-app --to-revision=1
+
+# ดู Status
+kubectl rollout status deployment/my-app
+# deployment "my-app" successfully rolled out
+
+# ตรวจสอบว่า Version กลับมาแล้ว
+curl $(minikube ip):30080 | python3 -m json.tool | grep version
+# "version": "v1.0"
+```
+
+---
+
+## แบบฝึกหัด 10 ข้อพร้อมเฉลย
+
+### ข้อที่ 1: Deploy Nginx บน Kubernetes
+
+**โจทย์**: Deploy Nginx Web Server โดยมี 3 Replicas และสร้าง NodePort Service
+
+**เฉลย**:
+
+```yaml
+# nginx-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "25m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+spec:
+  type: NodePort
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 30090
+```
+
+```bash
+kubectl apply -f nginx-deployment.yaml
+kubectl get pods,services
+curl $(minikube ip):30090
+```
+
+---
+
+### ข้อที่ 2: Scale Deployment
+
+**โจทย์**: Scale Nginx Deployment ที่สร้างในข้อ 1 จาก 3 เป็น 5 Replicas
+
+**เฉลย**:
+
+```bash
+# วิธีที่ 1: kubectl scale
+kubectl scale deployment nginx-web --replicas=5
+
+# วิธีที่ 2: แก้ไข YAML แล้ว apply ใหม่
+kubectl edit deployment nginx-web
+# แก้ replicas: 3 เป็น replicas: 5
+
+# วิธีที่ 3: kubectl patch
+kubectl patch deployment nginx-web -p '{"spec":{"replicas":5}}'
+
+# ตรวจสอบ
+kubectl get deployment nginx-web
+# NAME        READY   UP-TO-DATE   AVAILABLE   AGE
+# nginx-web   5/5     5            5           5m
+```
+
+---
+
+### ข้อที่ 3: ดู Logs จาก Pod
+
+**โจทย์**: แสดง Logs ล่าสุด 50 บรรทัดจาก Nginx Pod
+
+**เฉลย**:
+
+```bash
+# ดู Logs จาก Pod หนึ่งตัว
+POD_NAME=$(kubectl get pods -l app=nginx -o jsonpath='{.items[0].metadata.name}')
+kubectl logs $POD_NAME --tail=50
+
+# ดู Logs แบบ Stream
+kubectl logs $POD_NAME -f
+
+# ดู Logs จากทุก Pod ที่มี Label app=nginx
+kubectl logs -l app=nginx --tail=50
+
+# ดู Logs พร้อม Timestamp
+kubectl logs $POD_NAME --timestamps=true --tail=50
+```
+
+---
+
+### ข้อที่ 4: Debug Pod ที่ไม่ Start
+
+**โจทย์**: Pod ไม่ Start ต้องหาสาเหตุอย่างไร
+
+**เฉลย**:
+
+```bash
+# Step 1: ดู Pod Status
+kubectl get pods
+# NAME              READY   STATUS             RESTARTS   AGE
+# bad-pod-xxx       0/1     ImagePullBackOff   0          2m
+
+# Step 2: ดู Events
+kubectl describe pod bad-pod-xxx
+# Events:
+#   Warning  Failed     Failed to pull image "wrong-image:latest":
+#            rpc error: ...no such host
+
+# Step 3: ดู Logs (ถ้า Container เคย Start)
+kubectl logs bad-pod-xxx
+
+# Step 4: ดู Logs จาก Previous Container
+kubectl logs bad-pod-xxx --previous
+
+# Step 5: Exec เข้า Container เพื่อ Debug
+kubectl exec -it bad-pod-xxx -- sh
+
+# Step 6: ตรวจสอบ YAML ที่ Apply
+kubectl get pod bad-pod-xxx -o yaml
+```
+
+---
+
+### ข้อที่ 5: สร้าง ConfigMap และใช้ใน Pod
+
+**โจทย์**: สร้าง ConfigMap ที่มีค่า Config จากนั้นใช้ใน Pod
+
+**เฉลย**:
+
+```yaml
+# configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  APP_ENV: "production"
+  APP_PORT: "3000"
+  MAX_CONNECTIONS: "100"
+  LOG_LEVEL: "info"
+  DATABASE_URL: "postgres://db:5432/myapp"
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-config
+spec:
+  containers:
+  - name: app
+    image: nginx:alpine
+    envFrom:
+    - configMapRef:
+        name: app-config
+    env:
+    - name: SPECIFIC_KEY
+      valueFrom:
+        configMapKeyRef:
+          name: app-config
+          key: APP_ENV
+```
+
+```bash
+kubectl apply -f configmap.yaml
+
+# ตรวจสอบ Environment Variables ใน Pod
+kubectl exec app-with-config -- env | grep APP
+# APP_ENV=production
+# APP_PORT=3000
+```
+
+---
+
+### ข้อที่ 6: สร้าง Secret
+
+**โจทย์**: สร้าง Secret สำหรับ Database Password และใช้ใน Pod
+
+**เฉลย**:
+
+```bash
+# สร้าง Secret จาก Command Line
+kubectl create secret generic db-secret \
+  --from-literal=DB_USER=admin \
+  --from-literal=DB_PASSWORD=SuperSecret123! \
+  --from-literal=DB_NAME=myapp
+
+# หรือสร้างจาก YAML (ต้อง Base64 encode ก่อน)
+echo -n "admin" | base64          # YWRtaW4=
+echo -n "SuperSecret123!" | base64  # U3VwZXJTZWNyZXQxMjMh
+```
+
+```yaml
+# secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+type: Opaque
+data:
+  DB_USER: YWRtaW4=
+  DB_PASSWORD: U3VwZXJTZWNyZXQxMjMh
+  DB_NAME: bXlhcHA=
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-secret
+spec:
+  containers:
+  - name: app
+    image: nginx:alpine
+    envFrom:
+    - secretRef:
+        name: db-secret
+```
+
+```bash
+kubectl apply -f secret.yaml
+kubectl exec app-with-secret -- env | grep DB
+# DB_USER=admin
+# DB_PASSWORD=SuperSecret123!
+# DB_NAME=myapp
+```
+
+---
+
+### ข้อที่ 7: Rolling Update และ Rollback
+
+**โจทย์**: Update Nginx Deployment จาก version 1.25 เป็น 1.26 แล้ว Rollback กลับ
+
+**เฉลย**:
+
+```bash
+# ดู Version ปัจจุบัน
+kubectl get deployment nginx-web -o jsonpath='{.spec.template.spec.containers[0].image}'
+# nginx:1.25-alpine
+
+# Update Image พร้อม Annotation (สำหรับ History)
+kubectl set image deployment/nginx-web nginx=nginx:1.26-alpine \
+  --record  # deprecated แต่ยังใช้ได้
+
+# หรือใช้ Annotate แทน
+kubectl annotate deployment nginx-web \
+  kubernetes.io/change-cause="Update nginx to 1.26-alpine"
+kubectl set image deployment/nginx-web nginx=nginx:1.26-alpine
+
+# ดู Rollout Status
+kubectl rollout status deployment/nginx-web
+
+# ดู History
+kubectl rollout history deployment/nginx-web
+# REVISION  CHANGE-CAUSE
+# 1         <none>
+# 2         Update nginx to 1.26-alpine
+
+# Rollback
+kubectl rollout undo deployment/nginx-web
+
+# ดู Version หลัง Rollback
+kubectl get deployment nginx-web -o jsonpath='{.spec.template.spec.containers[0].image}'
+# nginx:1.25-alpine
+```
+
+---
+
+### ข้อที่ 8: Resource Limits
+
+**โจทย์**: สร้าง Pod ที่มีการกำหนด Resource Requests และ Limits
+
+**เฉลย**:
+
+```yaml
+# resource-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: resource-demo
+spec:
+  containers:
+  - name: app
+    image: nginx:alpine
+    resources:
+      requests:
+        memory: "64Mi"     # ขั้นต่ำที่ต้องการ
+        cpu: "100m"        # 100 millicores = 0.1 CPU
+      limits:
+        memory: "128Mi"    # สูงสุดที่ใช้ได้
+        cpu: "200m"        # 200 millicores = 0.2 CPU
+```
+
+```bash
+kubectl apply -f resource-pod.yaml
+
+# ดู Resource Usage
+kubectl top pod resource-demo
+# NAME            CPU(cores)   MEMORY(bytes)
+# resource-demo   1m           3Mi
+
+# ดู Resource Spec
+kubectl describe pod resource-demo | grep -A 8 "Limits:"
+# Limits:
+#   cpu:     200m
+#   memory:  128Mi
+# Requests:
+#   cpu:     100m
+#   memory:  64Mi
+```
+
+---
+
+### ข้อที่ 9: Namespace Isolation
+
+**โจทย์**: สร้าง 2 Namespaces (dev, prod) และ Deploy App แยกกัน
+
+**เฉลย**:
+
+```bash
+# สร้าง Namespaces
+kubectl create namespace dev
+kubectl create namespace prod
+
+# Deploy ไปยัง Namespace dev
+kubectl create deployment nginx-dev --image=nginx:1.25 \
+  --replicas=1 --namespace=dev
+
+# Deploy ไปยัง Namespace prod
+kubectl create deployment nginx-prod --image=nginx:1.26 \
+  --replicas=3 --namespace=prod
+
+# ดู Resources ใน Namespace ต่างๆ
+kubectl get all -n dev
+kubectl get all -n prod
+
+# ดู Resources ทุก Namespace
+kubectl get pods --all-namespaces
+# หรือ
+kubectl get pods -A
+
+# ลบ Namespace ทั้งหมด (ลบ Resources ใน Namespace ด้วย)
+kubectl delete namespace dev
+```
+
+---
+
+### ข้อที่ 10: Port Forward เพื่อ Debug
+
+**โจทย์**: เข้าถึง Service ใน Kubernetes โดยไม่ต้องสร้าง NodePort
+
+**เฉลย**:
+
+```bash
+# Port Forward จาก Pod ไปยัง Local
+kubectl port-forward pod/nginx-web-xxx 8080:80
+# Forwarding from 127.0.0.1:8080 -> 80
+
+# ใน Terminal อื่น
+curl http://localhost:8080
+# <html>Welcome to nginx!</html>
+
+# Port Forward จาก Service ไปยัง Local
+kubectl port-forward service/nginx-service 8080:80
+
+# Port Forward ไปยัง Namespace อื่น
+kubectl port-forward -n prod service/nginx-service 8080:80
+
+# Port Forward แบบ Background (ใช้ & หรือ nohup)
+kubectl port-forward service/nginx-service 8080:80 &
+PF_PID=$!
+
+# ทดสอบ
+curl http://localhost:8080
+
+# หยุด Port Forward
+kill $PF_PID
+```
+
+---
+
+## สรุป Part 01
+
+ใน Part แรกนี้เราได้เรียนรู้:
+
+1. **Kubernetes คืออะไร** - ระบบ Orchestration สำหรับ Containerized Applications
+2. **ทำไมต้องใช้ Kubernetes** - Self-healing, Scaling, Rolling Update, Service Discovery
+3. **Kubernetes vs Traditional VMs** - ประหยัด Resource, Deploy เร็วกว่า, ยืดหยุ่นกว่า
+4. **Real-world Case Studies** - Netflix, Airbnb, Spotify ใช้ Kubernetes แก้ปัญหาจริง
+5. **Kubernetes Roadmap** - Features ใหม่ใน 2024-2025
+6. **Workshop จริง** - ติดตั้ง Minikube, Deploy Node.js App, ทดสอบ Features ต่างๆ
+
+### Checklist ก่อนไปต่อ
+
+- [ ] ติดตั้ง Minikube และ kubectl ได้สำเร็จ
+- [ ] Deploy App ได้สำเร็จและเข้าถึงได้
+- [ ] ทดสอบ Self-healing (ลบ Pod แล้วเห็น Pod ใหม่)
+- [ ] ทดสอบ Scaling (Manual Scale ขึ้นและลง)
+- [ ] ทดสอบ Rolling Update และ Rollback
+- [ ] ทำแบบฝึกหัดครบ 10 ข้อ
+
+---
+
+*ต่อไป: [Part 02: Container Orchestration](./part-02-container-orchestration.md)*

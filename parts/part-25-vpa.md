@@ -912,3 +912,991 @@ VPA เป็นเครื่องมือที่ดีสำหรับ:
 - เริ่มด้วย Off mode เสมอ
 
 ในบทต่อไป เราจะเรียนรู้เรื่อง **Resource Limits** - การจัดการทรัพยากรของ Pods อย่างละเอียด
+
+---
+
+## VPA Algorithm Deep Dive
+
+### ภาพรวมของ VPA Algorithm
+
+VPA Recommender ใช้ algorithm หลายขั้นตอนในการคำนวณ recommendations:
+
+```
+1. เก็บ Metrics จาก Prometheus/Metrics Server
+   ↓
+2. Histogram Bucketing (เก็บ distribution ของการใช้ resources)
+   ↓
+3. Percentile Calculation (คำนวณ P50, P90, P95, P99)
+   ↓
+4. Apply Safety Margin
+   ↓
+5. Bound Recommendations ด้วย Min/Max policies
+   ↓
+6. คำนวณ Lower Bound, Target, Upper Bound
+```
+
+### Histogram Decay
+
+VPA ใช้ exponential decay histogram เพื่อให้ข้อมูลเก่ามีน้ำหนักน้อยกว่าข้อมูลใหม่
+
+```
+น้ำหนักของ sample ที่อายุ t ชั่วโมง = exp(-t * decay_factor)
+
+ค่า default:
+- CPU halflife: 24 ชั่วโมง (ข้อมูล 24h ที่แล้วมีน้ำหนักครึ่งหนึ่ง)
+- Memory halflife: 24 ชั่วโมง
+```
+
+### Percentile ที่ VPA ใช้
+
+```
+Target (ค่าที่แนะนำ):
+- CPU: Percentile 90 ของการใช้งานใน confidence window
+- Memory: Percentile 90 ของ Working Set Size
+
+Lower Bound (ค่าต่ำสุดที่ safe):
+- CPU: Percentile 50 (ไม่ต่ำกว่า P50)
+- Memory: Percentile 50
+
+Upper Bound (ค่าสูงสุดที่จำเป็น):
+- CPU: Percentile 95
+- Memory: Percentile 95
+```
+
+### Confidence Window
+
+VPA ต้องการข้อมูลอย่างน้อย X วันก่อนให้ recommendation
+
+```yaml
+# VPA Recommender configuration
+# ค่า default:
+# - confidenceMultiplier: 1.0 (ต้องการ data เพียงพอ)
+# - backoffLimit: ลองใหม่ถ้า data ไม่พอ
+
+# คำนวณ confidence:
+# confidence = min(1.0, dataAge / minRequiredAge)
+# minRequiredAge = 2 วัน (default)
+```
+
+---
+
+## VPA Components Deep Dive
+
+### 1. VPA Recommender
+
+Recommender เป็น component ที่คำนวณ resource recommendations
+
+```
+Architecture:
+┌─────────────────────────────────────────────┐
+│                VPA Recommender               │
+│                                              │
+│  ┌──────────────────────────────────────┐   │
+│  │  Metrics Fetch Loop (ทุก 1 นาที)     │   │
+│  │  - Prometheus / Metrics Server        │   │
+│  │  - เก็บ CPU/Memory usage history      │   │
+│  └──────────────────────────────────────┘   │
+│                ↓                            │
+│  ┌──────────────────────────────────────┐   │
+│  │  Histogram Update                    │   │
+│  │  - Update histogram buckets           │   │
+│  │  - Apply decay function              │   │
+│  └──────────────────────────────────────┘   │
+│                ↓                            │
+│  ┌──────────────────────────────────────┐   │
+│  │  Recommendation Calculation          │   │
+│  │  - คำนวณ percentiles                  │   │
+│  │  - Apply min/max bounds              │   │
+│  │  - Apply safety margin               │   │
+│  └──────────────────────────────────────┘   │
+│                ↓                            │
+│  ┌──────────────────────────────────────┐   │
+│  │  Update VPA Status                   │   │
+│  │  - เขียน recommendations ลง VPA object│   │
+│  └──────────────────────────────────────┘   │
+└─────────────────────────────────────────────┘
+```
+
+```bash
+# ดู Recommender logs
+kubectl logs -n kube-system \
+    deployment/vpa-recommender \
+    --tail=50
+
+# ดู Recommender metrics
+kubectl port-forward -n kube-system \
+    deployment/vpa-recommender 8942:8942
+curl http://localhost:8942/metrics | grep vpa_
+```
+
+### 2. VPA Admission Controller
+
+Admission Controller intercepted Pod creation request และปรับ resources
+
+```
+Flow:
+1. User/Controller สร้าง Pod
+2. API Server ส่งไปที่ Admission Webhook
+3. Admission Controller ดู VPA recommendation ที่ match
+4. ปรับ resources.requests และ resources.limits
+5. ส่ง Pod กลับไปให้ API Server
+6. Pod ถูกสร้างด้วย resources ที่ถูกปรับแล้ว
+```
+
+```yaml
+# ดู Admission Controller configuration
+kubectl get mutatingwebhookconfigurations | grep vpa
+
+# ดูรายละเอียด
+kubectl describe mutatingwebhookconfiguration vpa-webhook-config
+```
+
+```bash
+# ทดสอบว่า Admission Controller ทำงาน
+# สร้าง Pod แล้วดูว่า resources ถูกปรับหรือไม่
+cat > test-pod.yaml << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vpa-test
+spec:
+  containers:
+  - name: app
+    image: nginx
+    resources:
+      requests:
+        cpu: 1m
+        memory: 1Mi
+EOF
+
+kubectl apply -f test-pod.yaml
+kubectl get pod vpa-test \
+    -o jsonpath='{.spec.containers[0].resources}' | jq
+# ถ้า VPA Auto mode ทำงาน resources จะถูกปรับ
+```
+
+### 3. VPA Updater
+
+Updater ตรวจสอบ Running Pods และ evict ถ้า resources ต่างจาก recommendation มาก
+
+```
+Updater Loop (ทุก 1 นาที):
+1. List Pods ที่จัดการโดย VPA
+2. เปรียบเทียบ current resources กับ recommendation
+3. ถ้าต่างเกิน threshold → evict Pod
+4. Pod ใหม่จะถูกสร้างโดย ReplicaSet/StatefulSet
+5. Admission Controller ปรับ resources ตอนสร้างใหม่
+```
+
+```bash
+# ดู Updater logs
+kubectl logs -n kube-system \
+    deployment/vpa-updater \
+    --tail=50
+
+# ดู eviction events
+kubectl get events \
+    --field-selector reason=EvictedByVPA \
+    --all-namespaces
+```
+
+---
+
+## VPA + HPA ใช้ร่วมกัน
+
+### ปัญหาและข้อจำกัด
+
+ไม่ควรใช้ VPA และ HPA กับ metric เดียวกัน เพราะ:
+- HPA scale Pods ตาม CPU/Memory
+- VPA ปรับ CPU/Memory requests
+- ถ้าใช้ร่วมกันบน CPU: VPA เพิ่ม CPU request → HPA เห็น CPU utilization ลด → scale down → VPA เห็น load สูงขึ้น → เพิ่ม CPU อีก (loop)
+
+### Pattern ที่แนะนำ: VPA สำหรับ Memory, HPA สำหรับ CPU
+
+```yaml
+# VPA: ปรับ Memory อัตโนมัติ
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: my-app-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: my-container
+      controlledResources:
+      # VPA ควบคุมเฉพาะ memory
+      - memory
+      minAllowed:
+        memory: 64Mi
+      maxAllowed:
+        memory: 4Gi
+```
+
+```yaml
+# HPA: scale ตาม CPU
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  # ไม่ใช้ memory ใน HPA เพราะ VPA จัดการอยู่
+```
+
+```yaml
+# Deployment ที่ใช้ร่วมกัน
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: my-container
+        image: my-app:1.0
+        resources:
+          requests:
+            # CPU: HPA จะ scale ตาม metric นี้
+            cpu: 200m
+            # Memory: VPA จะปรับค่านี้
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+```
+
+### Pattern 2: VPA Off + HPA custom metrics
+
+```yaml
+# VPA ใช้เฉพาะ recommend (ไม่ auto-update)
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: my-app-vpa-advisory
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  updatePolicy:
+    updateMode: "Off"     # แค่ recommend ไม่แก้ไข
+  resourcePolicy:
+    containerPolicies:
+    - containerName: my-container
+      controlledResources: ["cpu", "memory"]
+```
+
+```yaml
+# HPA ใช้ custom metrics (ไม่ใช่ CPU/Memory)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: External
+    external:
+      metric:
+        name: queue_messages_ready
+        selector:
+          matchLabels:
+            queue: "my-queue"
+      target:
+        type: Value
+        value: "100"
+```
+
+### ตรวจสอบ VPA + HPA ทำงานร่วมกัน
+
+```bash
+# ดู VPA recommendations
+kubectl get vpa my-app-vpa -o yaml | \
+    grep -A20 "recommendation:"
+
+# ดู HPA status
+kubectl get hpa my-app-hpa
+
+# Monitor ทั้งสอง
+watch -n 5 "
+echo '=== VPA Recommendations ===';
+kubectl get vpa my-app-vpa -o jsonpath='{.status.recommendation}' | jq;
+echo '';
+echo '=== HPA Status ===';
+kubectl get hpa my-app-hpa;
+echo '';
+echo '=== Pod Resources ===';
+kubectl get pods -l app=my-app \
+    -o custom-columns='NAME:.metadata.name,CPU-REQ:.spec.containers[0].resources.requests.cpu,MEM-REQ:.spec.containers[0].resources.requests.memory';
+"
+```
+
+---
+
+## Custom VPA Policies
+
+### Policy ตาม Container
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: multi-container-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: multi-container-app
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    # Container หลัก: ปรับได้มาก
+    - containerName: main-app
+      controlledResources: ["cpu", "memory"]
+      minAllowed:
+        cpu: 100m
+        memory: 128Mi
+      maxAllowed:
+        cpu: "4"
+        memory: 8Gi
+    # Sidecar: จำกัดให้เล็ก
+    - containerName: log-agent
+      controlledResources: ["cpu", "memory"]
+      minAllowed:
+        cpu: 10m
+        memory: 16Mi
+      maxAllowed:
+        cpu: 200m
+        memory: 256Mi
+    # Prometheus exporter: ไม่ให้ VPA ปรับ
+    - containerName: metrics-exporter
+      mode: "Off"
+```
+
+### Policy สำหรับ Critical Applications
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: critical-app-vpa
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-processor
+  updatePolicy:
+    updateMode: Auto
+    # Eviction policy - เมื่อไหรจะ evict Pod
+    evictionRequirements:
+    # ต้องมี Pod อื่น Running อยู่อย่างน้อย 1 ตัวก่อน evict
+    - resources: ["cpu", "memory"]
+      changeRequirement: TargetHigherThanRequests
+  resourcePolicy:
+    containerPolicies:
+    - containerName: payment
+      controlledResources: ["cpu", "memory"]
+      minAllowed:
+        # กำหนด minimum ที่ safe สำหรับ production
+        cpu: 500m
+        memory: 512Mi
+      maxAllowed:
+        # จำกัด max เพื่อควบคุม cost
+        cpu: "8"
+        memory: 16Gi
+```
+
+### Policy แบบ Conservative (ปลอดภัยกว่า)
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: conservative-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  updatePolicy:
+    # Initial: ปรับเฉพาะ Pod ใหม่ (ไม่ evict ที่รันอยู่)
+    updateMode: Initial
+  resourcePolicy:
+    containerPolicies:
+    - containerName: app
+      controlledResources: ["memory"]   # เฉพาะ memory เท่านั้น
+      minAllowed:
+        memory: 128Mi
+      maxAllowed:
+        memory: 2Gi
+```
+
+---
+
+## Workshop ละเอียด: ปรับ Resources อัตโนมัติ
+
+### ภาพรวม Workshop
+
+Workshop นี้จะ:
+1. ติดตั้ง VPA ในสภาพแวดล้อม local
+2. Deploy application ที่มี resources ไม่เหมาะสม
+3. เฝ้าดู VPA recommendations
+4. Enable Auto mode และสังเกตการปรับ
+5. ใช้ร่วมกับ HPA
+
+### ขั้นตอนที่ 1: ติดตั้ง VPA (Minikube/Kind)
+
+```bash
+# Clone VPA repo
+git clone https://github.com/kubernetes/autoscaler.git
+cd autoscaler/vertical-pod-autoscaler
+
+# ติดตั้ง VPA components
+./hack/vpa-install.sh
+
+# ตรวจสอบการติดตั้ง
+kubectl get pods -n kube-system | grep vpa
+# ควรเห็น:
+# vpa-admission-controller-xxx   1/1     Running
+# vpa-recommender-xxx            1/1     Running
+# vpa-updater-xxx                1/1     Running
+
+# ตรวจสอบ CRDs
+kubectl get crd | grep autoscaling.k8s.io
+# verticalpodautoscalers.autoscaling.k8s.io
+# verticalpodautoscalercheckpoints.autoscaling.k8s.io
+```
+
+### ขั้นตอนที่ 2: Deploy Application ที่มี Resources ไม่เหมาะสม
+
+```bash
+cat > workshop-app.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resource-demo
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: resource-demo
+  template:
+    metadata:
+      labels:
+        app: resource-demo
+    spec:
+      containers:
+      - name: demo
+        image: polinux/stress
+        # Resources ที่ over-provisioned มาก
+        resources:
+          requests:
+            cpu: "2"        # ต้องการจริงๆ แค่ 200m
+            memory: 2Gi     # ต้องการจริงๆ แค่ 256Mi
+          limits:
+            cpu: "4"
+            memory: 4Gi
+        command:
+        - stress
+        args:
+        # CPU load: ~200m cores
+        - "--cpu"
+        - "1"
+        - "--cpu-load"
+        - "20"
+        # Memory: ~200Mi
+        - "--vm"
+        - "1"
+        - "--vm-bytes"
+        - "200M"
+        - "--vm-hang"
+        - "1"
+EOF
+
+kubectl apply -f workshop-app.yaml
+kubectl get pods
+```
+
+### ขั้นตอนที่ 3: ตั้ง VPA ใน Off Mode (สังเกต)
+
+```bash
+cat > workshop-vpa-off.yaml << 'EOF'
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: resource-demo-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: resource-demo
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: demo
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: "4"
+        memory: 8Gi
+EOF
+
+kubectl apply -f workshop-vpa-off.yaml
+
+# รอ VPA เก็บข้อมูล (อย่างน้อย 5-10 นาที)
+echo "Waiting for VPA to collect data..."
+sleep 300  # รอ 5 นาที
+```
+
+### ขั้นตอนที่ 4: ดู Recommendations
+
+```bash
+# ดู VPA recommendations
+kubectl describe vpa resource-demo-vpa
+
+# ดูแบบ YAML ละเอียด
+kubectl get vpa resource-demo-vpa -o yaml
+
+# Script ดู recommendations อย่างชัดเจน
+kubectl get vpa resource-demo-vpa -o json | jq '
+  .status.recommendation.containerRecommendations[] |
+  {
+    container: .containerName,
+    lowerBound: .lowerBound,
+    target: .target,
+    upperBound: .upperBound,
+    uncappedTarget: .uncappedTarget
+  }
+'
+
+# ผลลัพธ์ตัวอย่าง:
+# {
+#   "container": "demo",
+#   "target": { "cpu": "202m", "memory": "262144k" },
+#   "lowerBound": { "cpu": "100m", "memory": "131072k" },
+#   "upperBound": { "cpu": "404m", "memory": "524288k" }
+# }
+# เห็นได้ชัดว่า ค่า request เดิม (2 CPU, 2Gi) นั้น over-provision มาก
+```
+
+### ขั้นตอนที่ 5: Enable Auto Mode
+
+```bash
+# อัพเดต VPA เป็น Auto mode
+kubectl patch vpa resource-demo-vpa \
+    --type=merge \
+    -p '{"spec":{"updatePolicy":{"updateMode":"Auto"}}}'
+
+# สังเกต VPA Updater ทำงาน
+kubectl get events \
+    --sort-by='.lastTimestamp' | grep -i evict
+
+# ดู Pods ถูก evict และสร้างใหม่
+kubectl get pods -w
+
+# ดู resources ของ Pod ใหม่
+kubectl get pods -l app=resource-demo \
+    -o custom-columns=\
+"NAME:.metadata.name,\
+CPU-REQ:.spec.containers[0].resources.requests.cpu,\
+MEM-REQ:.spec.containers[0].resources.requests.memory"
+# ควรเห็นค่าต่ำกว่าเดิมมาก
+```
+
+### ขั้นตอนที่ 6: เพิ่ม HPA สำหรับ Scale
+
+```bash
+cat > workshop-hpa.yaml << 'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: resource-demo-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: resource-demo
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+EOF
+
+kubectl apply -f workshop-hpa.yaml
+
+# แก้ไข VPA ให้ควบคุมเฉพาะ memory (ไม่ใช่ CPU ที่ HPA ใช้อยู่)
+kubectl patch vpa resource-demo-vpa \
+    --type=merge \
+    -p '{
+      "spec": {
+        "resourcePolicy": {
+          "containerPolicies": [{
+            "containerName": "demo",
+            "controlledResources": ["memory"]
+          }]
+        }
+      }
+    }'
+```
+
+### ขั้นตอนที่ 7: สรุปผลการ Workshop
+
+```bash
+# Dashboard สรุป
+echo "=== Workshop Summary ==="
+echo ""
+echo "=== VPA Recommendations ==="
+kubectl get vpa resource-demo-vpa -o jsonpath=\
+'{.status.recommendation.containerRecommendations[0]}' | jq
+
+echo ""
+echo "=== HPA Status ==="
+kubectl get hpa resource-demo-hpa
+
+echo ""
+echo "=== Current Pod Resources ==="
+kubectl get pods -l app=resource-demo \
+    -o custom-columns=\
+"NAME:.metadata.name,\
+REPLICAS:.metadata.name,\
+CPU-REQ:.spec.containers[0].resources.requests.cpu,\
+MEM-REQ:.spec.containers[0].resources.requests.memory,\
+CPU-LIM:.spec.containers[0].resources.limits.cpu,\
+MEM-LIM:.spec.containers[0].resources.limits.memory"
+
+echo ""
+echo "=== Resource Savings ==="
+echo "Original CPU request: 2000m per pod"
+echo "Optimized CPU request: ~200m per pod"
+echo "CPU savings: ~90%"
+echo ""
+echo "Original Memory request: 2048Mi per pod"
+echo "Optimized Memory request: ~256Mi per pod"
+echo "Memory savings: ~87%"
+
+# Cleanup
+kubectl delete -f workshop-app.yaml
+kubectl delete -f workshop-vpa-off.yaml
+kubectl delete -f workshop-hpa.yaml
+```
+
+---
+
+## แบบฝึกหัด: VPA
+
+### แบบฝึกหัดที่ 1: VPA Off Mode
+
+**โจทย์**: สร้าง VPA ใน Off mode สำหรับ nginx deployment แล้วดู recommendations
+
+**เฉลย**:
+```bash
+# สร้าง nginx deployment
+kubectl create deployment nginx-app \
+    --image=nginx:1.21 \
+    --replicas=2
+
+# ตั้ง resource requests (จงใจ over-provision)
+kubectl set resources deployment/nginx-app \
+    --requests=cpu=500m,memory=512Mi \
+    --limits=cpu=2,memory=2Gi
+
+# สร้าง VPA
+cat > nginx-vpa.yaml << 'EOF'
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: nginx-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx-app
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: nginx
+      minAllowed:
+        cpu: 25m
+        memory: 32Mi
+      maxAllowed:
+        cpu: "2"
+        memory: 2Gi
+EOF
+kubectl apply -f nginx-vpa.yaml
+
+# รอ 5-10 นาที แล้วดู recommendations
+sleep 300
+kubectl describe vpa nginx-vpa
+```
+
+---
+
+### แบบฝึกหัดที่ 2: VPA Initial Mode
+
+**โจทย์**: เปลี่ยน VPA เป็น Initial mode แล้วสังเกต: Pods เดิมไม่ถูก restart แต่ Pods ใหม่ได้ resources ที่ปรับแล้ว
+
+**เฉลย**:
+```bash
+# อัพเดต VPA mode
+kubectl patch vpa nginx-vpa \
+    --type=merge \
+    -p '{"spec":{"updatePolicy":{"updateMode":"Initial"}}}'
+
+# Scale down แล้ว scale up เพื่อทดสอบ
+kubectl scale deployment/nginx-app --replicas=0
+kubectl scale deployment/nginx-app --replicas=2
+
+# ดู resources ของ Pods ใหม่
+kubectl get pods -l app=nginx-app \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].resources}{"\n"}{end}'
+# Pods ใหม่ควรมี resources ตาม VPA recommendation
+```
+
+---
+
+### แบบฝึกหัดที่ 3: Container-specific Policy
+
+**โจทย์**: สร้าง Deployment ที่มี 2 containers (main + sidecar) แล้วตั้ง VPA policy แตกต่างกัน
+
+**เฉลย**:
+```yaml
+# Deployment ที่มี 2 containers
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: two-container-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: two-container
+  template:
+    metadata:
+      labels:
+        app: two-container
+    spec:
+      containers:
+      - name: main-app
+        image: nginx:1.21
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 1Gi
+      - name: log-sidecar
+        image: busybox
+        command: ["sh", "-c", "while true; do sleep 30; done"]
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+```
+
+```yaml
+# VPA ที่มี policy แตกต่างกันต่อ container
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: two-container-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: two-container-app
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    # Main app: ปรับได้ทั้ง CPU และ Memory
+    - containerName: main-app
+      controlledResources: ["cpu", "memory"]
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: "4"
+        memory: 8Gi
+    # Sidecar: ปรับได้แค่ Memory
+    - containerName: log-sidecar
+      controlledResources: ["memory"]
+      minAllowed:
+        memory: 16Mi
+      maxAllowed:
+        memory: 256Mi
+```
+
+---
+
+### แบบฝึกหัดที่ 4: VPA + HPA ร่วมกัน
+
+**โจทย์**: ตั้ง VPA ควบคุม memory และ HPA scale ตาม CPU สำหรับ application เดียวกัน
+
+**เฉลย**:
+```bash
+# สร้าง Deployment
+kubectl create deployment combo-app \
+    --image=nginx:1.21 \
+    --replicas=2
+
+kubectl set resources deployment/combo-app \
+    --requests=cpu=200m,memory=256Mi \
+    --limits=cpu=1,memory=1Gi
+
+# VPA สำหรับ memory เท่านั้น
+cat > combo-vpa.yaml << 'EOF'
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: combo-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: combo-app
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: nginx
+      # ควบคุมเฉพาะ memory
+      controlledResources: ["memory"]
+      minAllowed:
+        memory: 64Mi
+      maxAllowed:
+        memory: 2Gi
+EOF
+kubectl apply -f combo-vpa.yaml
+
+# HPA สำหรับ CPU
+kubectl autoscale deployment combo-app \
+    --cpu-percent=70 \
+    --min=2 \
+    --max=10
+
+# ตรวจสอบทั้งสอง
+kubectl get vpa combo-vpa
+kubectl get hpa combo-app
+```
+
+---
+
+### แบบฝึกหัดที่ 5: Debugging VPA
+
+**โจทย์**: แก้ปัญหา VPA ที่ไม่แสดง recommendations
+
+```bash
+# สร้าง VPA ที่มีปัญหา (target ไม่มีอยู่จริง)
+cat > broken-vpa.yaml << 'EOF'
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: broken-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nonexistent-deployment
+  updatePolicy:
+    updateMode: "Off"
+EOF
+kubectl apply -f broken-vpa.yaml
+```
+
+**เฉลย - การ Debug**:
+```bash
+# ขั้นที่ 1: ตรวจสอบ VPA status
+kubectl describe vpa broken-vpa
+# ดูใน Conditions - จะเห็น error ว่า target ไม่มีอยู่
+
+# ขั้นที่ 2: ดู VPA Recommender logs
+kubectl logs -n kube-system \
+    deployment/vpa-recommender | grep broken-vpa
+
+# ขั้นที่ 3: แก้ไข VPA ให้ชี้ไปที่ deployment ที่มีจริง
+kubectl patch vpa broken-vpa \
+    --type=merge \
+    -p '{"spec":{"targetRef":{"name":"nginx-app"}}}'
+
+# ขั้นที่ 4: ตรวจสอบอีกครั้ง
+kubectl describe vpa broken-vpa
+# ควรเห็น recommendations หลังจากรอสักครู่
+```
+
+---
+
+## สรุปทบทวน VPA
+
+### Cheat Sheet
+
+```bash
+# สร้าง VPA
+kubectl apply -f vpa.yaml
+
+# ดูรายการ VPA
+kubectl get vpa
+kubectl get vpa --all-namespaces
+
+# ดู recommendations
+kubectl describe vpa <name>
+kubectl get vpa <name> -o yaml | grep -A20 recommendation
+
+# เปลี่ยน mode
+kubectl patch vpa <name> \
+    --type=merge \
+    -p '{"spec":{"updatePolicy":{"updateMode":"Auto"}}}'
+
+# ลบ VPA
+kubectl delete vpa <name>
+```
+
+### สรุปเปรียบเทียบ VPA Modes
+
+| Mode | ปรับ Pod ที่รัน | ปรับ Pod ใหม่ | แนะนำสำหรับ |
+|------|----------------|--------------|------------|
+| Off | ไม่ | ไม่ | สังเกตเท่านั้น |
+| Initial | ไม่ | ใช่ | ระวัง disruption |
+| Recreate | ใช่ (evict) | ใช่ | ยอมรับ restart |
+| Auto | ใช่ (intelligent) | ใช่ | production ที่ stable |
+
+VPA เป็นเครื่องมือที่ทรงพลังในการ optimize resource usage แต่ต้องเข้าใจ trade-off ระหว่างความแม่นยำของ recommendations และ disruption ที่เกิดจาก Pod eviction

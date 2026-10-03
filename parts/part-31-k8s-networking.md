@@ -906,3 +906,1358 @@ kubectl delete pod <pod-name> --grace-period=0 --force
 ---
 
 *ต่อไป: [Part 32 - ClusterIP Service](./part-32-clusterip.md)*
+
+---
+
+## 6. CNI Plugin เชิงลึก {#cni-deep-dive}
+
+### 6.1 Calico CNI - BGP Configuration
+
+Calico เป็น CNI ที่ใช้ BGP (Border Gateway Protocol) สำหรับ routing ระหว่าง Nodes โดยไม่ต้องใช้ overlay network
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Calico BGP Architecture                       │
+│                                                                   │
+│  Node 1 (10.0.0.1)          Node 2 (10.0.0.2)                   │
+│  ┌─────────────────┐        ┌─────────────────┐                  │
+│  │  Pod CIDR:      │  BGP   │  Pod CIDR:      │                  │
+│  │  192.168.1.0/24 │◄──────►│  192.168.2.0/24 │                  │
+│  │                 │ Peering│                  │                  │
+│  │  Bird BGP       │        │  Bird BGP        │                  │
+│  │  (calico-node)  │        │  (calico-node)   │                  │
+│  └─────────────────┘        └─────────────────┘                  │
+│           │                          │                            │
+│           └──────────┬───────────────┘                           │
+│                      ▼                                            │
+│              Top of Rack Switch                                   │
+│              (BGP Router)                                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### ติดตั้ง Calico
+
+```bash
+# ติดตั้ง Calico operator
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+
+# สร้าง Installation resource
+kubectl create -f - <<EOF
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    ipPools:
+    - blockSize: 26
+      cidr: 192.168.0.0/16
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
+EOF
+```
+
+#### Calico BGP Peer Configuration
+
+```yaml
+# bgppeer.yaml - กำหนด BGP Peer กับ External Router
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: external-router
+spec:
+  peerIP: 10.0.0.254        # IP ของ External BGP Router
+  asNumber: 65000           # AS Number ของ External Router
+  nodeSelector: all()       # Apply กับทุก Node
+
+---
+# bgpconfiguration.yaml - ตั้งค่า BGP Global
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  logSeverityScreen: Info
+  nodeToNodeMeshEnabled: true    # Full mesh BGP ระหว่าง nodes
+  asNumber: 65001               # AS Number ของ Cluster
+  serviceClusterIPs:
+  - cidr: 10.96.0.0/12          # Advertise ClusterIP range
+  serviceExternalIPs:
+  - cidr: 203.0.113.0/24        # Advertise External IP range
+```
+
+#### Calico IP Pool Configuration
+
+```yaml
+# ippool.yaml - กำหนด IP Pool
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: default-ipv4-ippool
+spec:
+  cidr: 192.168.0.0/16
+  blockSize: 26                 # /26 = 64 IPs per block
+  ipipMode: Never               # ปิด IP-in-IP
+  vxlanMode: CrossSubnet        # VXLAN เฉพาะ cross-subnet
+  natOutgoing: true
+  nodeSelector: all()
+  disabled: false
+
+---
+# ippool-gpu-nodes.yaml - IP Pool แยกสำหรับ GPU Nodes
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: gpu-nodes-pool
+spec:
+  cidr: 172.16.0.0/24
+  blockSize: 28                 # /28 = 16 IPs per block
+  nodeSelector: gpu == "true"
+  natOutgoing: true
+```
+
+#### Calico Network Policy (ละเอียดกว่า Kubernetes NetworkPolicy)
+
+```yaml
+# calico-network-policy.yaml
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: allow-app-traffic
+  namespace: production
+spec:
+  selector: app == "web"        # Apply กับ Pod ที่มี label app=web
+  types:
+  - Ingress
+  - Egress
+  ingress:
+  - action: Allow
+    protocol: TCP
+    source:
+      selector: app == "frontend"
+      namespaceSelector: tier == "frontend"
+    destination:
+      ports:
+      - 8080
+  - action: Allow
+    protocol: TCP
+    source:
+      nets:
+      - 10.0.0.0/8              # Allow จาก Internal Network
+    destination:
+      ports:
+      - 443
+  egress:
+  - action: Allow
+    protocol: TCP
+    destination:
+      selector: app == "database"
+      ports:
+      - 5432
+  - action: Allow
+    protocol: UDP
+    destination:
+      ports:
+      - 53                      # DNS
+  - action: Deny               # Block traffic อื่นๆ
+    destination:
+      nets:
+      - 169.254.169.254/32      # Block AWS metadata
+
+---
+# calico-global-network-policy.yaml - Policy ระดับ Global
+apiVersion: projectcalico.org/v3
+kind: GlobalNetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  selector: all()
+  order: 1000                   # ลำดับความสำคัญ (ต่ำ = สูง)
+  types:
+  - Ingress
+  - Egress
+  egress:
+  - action: Allow
+    protocol: UDP
+    destination:
+      ports:
+      - 53                      # Allow DNS
+  - action: Allow
+    destination:
+      nets:
+      - 10.96.0.0/12            # Allow to cluster services
+```
+
+#### Calico Commands
+
+```bash
+# ดู BGP Peers
+calicoctl get bgppeers
+calicoctl get bgpconfiguration
+
+# ดู IP Pools
+calicoctl get ippools -o wide
+calicoctl get ipam nodes
+
+# ดู IPAM allocations
+calicoctl ipam show --show-blocks
+calicoctl ipam show --ip=192.168.1.10
+
+# Debug BGP
+calicoctl node status
+calicoctl node diags
+
+# ดู Routes ที่ Bird advertise
+kubectl exec -n calico-system -it $(kubectl get pod -n calico-system -l k8s-app=calico-node -o jsonpath='{.items[0].metadata.name}') -- birdcl show route
+
+# ดู Felix logs
+kubectl logs -n calico-system -l k8s-app=calico-node -c calico-node --tail=50
+```
+
+---
+
+### 6.2 Flannel CNI - VXLAN Configuration
+
+Flannel เป็น CNI ที่ง่ายที่สุด ใช้ VXLAN overlay network สำหรับ pod-to-pod communication
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Flannel VXLAN Architecture                    │
+│                                                                   │
+│  Node 1                           Node 2                         │
+│  ┌──────────────────┐             ┌──────────────────┐           │
+│  │  Pod: 10.244.1.2 │             │  Pod: 10.244.2.3 │           │
+│  │       │          │             │       ▲          │           │
+│  │       ▼          │             │       │          │           │
+│  │    cni0 bridge   │             │    cni0 bridge   │           │
+│  │  10.244.1.1/24   │             │  10.244.2.1/24   │           │
+│  │       │          │             │       │          │           │
+│  │       ▼          │             │       ▼          │           │
+│  │    flannel.1     │   VXLAN     │    flannel.1     │           │
+│  │  (VTEP device)   │◄───────────►│  (VTEP device)   │           │
+│  │       │          │  UDP:8472   │       │          │           │
+│  │       ▼          │             │       ▼          │           │
+│  │    eth0          │             │    eth0          │           │
+│  │  192.168.1.10    │             │  192.168.1.11    │           │
+│  └──────────────────┘             └──────────────────┘           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### ติดตั้ง Flannel
+
+```bash
+# ติดตั้ง Flannel
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+# หรือ custom CIDR
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-flannel-cfg
+  namespace: kube-flannel
+  labels:
+    tier: node
+    app: flannel
+data:
+  cni-conf.json: |
+    {
+      "name": "cbr0",
+      "cniVersion": "0.3.1",
+      "plugins": [
+        {
+          "type": "flannel",
+          "delegate": {
+            "hairpinMode": true,
+            "isDefaultGateway": true
+          }
+        },
+        {
+          "type": "portmap",
+          "capabilities": {
+            "portMappings": true
+          }
+        }
+      ]
+    }
+  net-conf.json: |
+    {
+      "Network": "10.244.0.0/16",
+      "Backend": {
+        "Type": "vxlan",
+        "VNI": 1,
+        "Port": 8472,
+        "DirectRouting": true
+      }
+    }
+EOF
+```
+
+#### Flannel Backend Types
+
+```yaml
+# VXLAN Backend (default) - ปลอดภัย, overhead สูง
+net-conf.json: |
+  {
+    "Network": "10.244.0.0/16",
+    "Backend": {
+      "Type": "vxlan",
+      "VNI": 1,
+      "Port": 8472,
+      "DirectRouting": false   # true = ใช้ direct route ถ้า nodes อยู่ subnet เดียว
+    }
+  }
+
+# Host-GW Backend - Performance สูง, ต้องอยู่ L2 เดียวกัน
+net-conf.json: |
+  {
+    "Network": "10.244.0.0/16",
+    "Backend": {
+      "Type": "host-gw"
+    }
+  }
+
+# WireGuard Backend - Encrypted
+net-conf.json: |
+  {
+    "Network": "10.244.0.0/16",
+    "Backend": {
+      "Type": "wireguard",
+      "PSK": "pre-shared-key-here",
+      "Port": 51820
+    }
+  }
+
+# IPSec Backend - Encrypted
+net-conf.json: |
+  {
+    "Network": "10.244.0.0/16",
+    "Backend": {
+      "Type": "ipsec",
+      "PSK": "pre-shared-key-here"
+    }
+  }
+```
+
+#### Debug Flannel
+
+```bash
+# ดู Flannel logs
+kubectl logs -n kube-flannel -l app=flannel --tail=50
+
+# ดู routes ที่ Flannel สร้าง
+ip route show | grep flannel
+ip route show | grep "10.244"
+
+# ดู VXLAN interface
+ip -d link show flannel.1
+bridge fdb show dev flannel.1
+
+# ดู ARP table
+arp -an | grep flannel
+
+# ตรวจสอบ VXLAN packets
+tcpdump -i eth0 'udp port 8472' -XX -n
+```
+
+---
+
+### 6.3 Cilium CNI - eBPF Architecture
+
+Cilium ใช้ eBPF (extended Berkeley Packet Filter) แทน iptables สำหรับ networking, security, และ observability
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Cilium eBPF Architecture                      │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                    Linux Kernel                           │   │
+│  │                                                           │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │                  eBPF Programs                   │    │   │
+│  │  │                                                   │    │   │
+│  │  │  TC Ingress ──► Policy Enforcement ──► Forwarding│    │   │
+│  │  │  TC Egress  ◄── Load Balancing   ◄── NAT        │    │   │
+│  │  │                                                   │    │   │
+│  │  │  eBPF Maps (Shared State):                       │    │   │
+│  │  │  - Policy Map                                     │    │   │
+│  │  │  - Connection Tracking Map                        │    │   │
+│  │  │  - Service Map (replaces kube-proxy)              │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                   │
+│  Userspace:                                                       │
+│  - Cilium Agent (DaemonSet)                                       │
+│  - Cilium Operator                                                │
+│  - Hubble (Observability)                                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### ติดตั้ง Cilium
+
+```bash
+# ติดตั้ง Cilium CLI
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz
+tar xzvfC cilium-linux-amd64.tar.gz /usr/local/bin
+
+# ติดตั้ง Cilium ใน cluster
+cilium install --version 1.14.0
+
+# หรือใช้ Helm
+helm repo add cilium https://helm.cilium.io/
+helm install cilium cilium/cilium --version 1.14.0 \
+  --namespace kube-system \
+  --set kubeProxyReplacement=true \
+  --set k8sServiceHost=10.0.0.1 \
+  --set k8sServicePort=6443 \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true
+
+# ตรวจสอบ status
+cilium status --wait
+cilium connectivity test
+```
+
+#### Cilium CiliumNetworkPolicy
+
+```yaml
+# cilium-l7-policy.yaml - Layer 7 Policy (HTTP-aware)
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: api-gateway-policy
+  namespace: production
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api-server
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/api/v1/.*"       # Allow GET /api/v1/*
+        - method: "POST"
+          path: "/api/v1/users"    # Allow POST /api/v1/users
+        - method: "PUT"
+          path: "/api/v1/users/[0-9]+"  # Allow PUT /api/v1/users/{id}
+  - fromEndpoints:
+    - matchLabels:
+        app: admin
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "DELETE"
+          path: "/api/v1/.*"       # Admin can DELETE
+
+---
+# cilium-dns-policy.yaml - DNS-based Policy
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-external-dns
+spec:
+  endpointSelector:
+    matchLabels:
+      app: web
+  egress:
+  - toFQDNs:
+    - matchName: "api.github.com"
+    - matchPattern: "*.amazonaws.com"
+    - matchPattern: "*.googleapis.com"
+    toPorts:
+    - ports:
+      - port: "443"
+        protocol: TCP
+  - toEndpoints:
+    - matchLabels:
+        "k8s:io.kubernetes.pod.namespace": kube-system
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*"
+```
+
+#### Hubble - Cilium Observability
+
+```bash
+# ติดตั้ง Hubble CLI
+HUBBLE_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/hubble/master/stable.txt)
+curl -L --remote-name-all https://github.com/cilium/hubble/releases/download/$HUBBLE_VERSION/hubble-linux-amd64.tar.gz
+tar xzvfC hubble-linux-amd64.tar.gz /usr/local/bin
+
+# Enable Hubble port-forward
+cilium hubble port-forward &
+
+# ดู traffic flows
+hubble observe --namespace production --follow
+hubble observe --pod frontend/web-xxx --protocol tcp
+hubble observe --verdict DROPPED --follow
+
+# ดู traffic ระหว่าง namespaces
+hubble observe \
+  --namespace production \
+  --to-namespace database \
+  --follow
+
+# ดู HTTP requests
+hubble observe \
+  --protocol http \
+  --http-url /api/v1/users \
+  --follow
+
+# ดู statistics
+hubble observe summary
+```
+
+---
+
+## 7. Pod IP Allocation {#pod-ip-allocation}
+
+### 7.1 กระบวนการ Allocate IP ให้ Pod
+
+```
+1. User submits Pod spec → API Server
+2. API Server stores Pod in etcd (no IP yet)
+3. Scheduler assigns Pod to a Node
+4. Kubelet on that Node receives the Pod assignment
+5. Kubelet calls CRI (Container Runtime Interface)
+6. CRI calls CNI plugin via /etc/cni/net.d/
+7. CNI plugin allocates IP from IPAM
+8. CNI creates veth pair (pod ↔ node bridge)
+9. CNI assigns IP to pod's veth interface
+10. CNI updates routing tables
+11. Pod starts with allocated IP
+```
+
+```bash
+# ดูขั้นตอนการ allocate IP
+# 1. ดู IPAM configuration
+cat /etc/cni/net.d/10-flannel.conflist
+cat /etc/cni/net.d/10-calico.conflist
+
+# 2. ดู IP ranges ที่แต่ละ Node ได้รับ
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'
+
+# 3. ดู IPs ที่ถูกใช้งาน
+kubectl get pods --all-namespaces -o wide | awk '{print $8}'
+
+# 4. ดู IP allocation ใน Calico
+calicoctl ipam show --show-blocks
+```
+
+### 7.2 IPAM (IP Address Management)
+
+```yaml
+# ตัวอย่าง CNI config พร้อม IPAM
+{
+  "cniVersion": "0.4.0",
+  "name": "k8s-pod-network",
+  "type": "calico",
+  "log_level": "info",
+  "datastore_type": "kubernetes",
+  "nodename": "__KUBERNETES_NODE_NAME__",
+  "mtu": "__CNI_MTU__",
+  "ipam": {
+    "type": "calico-ipam",
+    "assign_ipv4": "true",
+    "assign_ipv6": "false",
+    "ipv4_pools": ["192.168.0.0/16"],
+    "ipv6_pools": []
+  },
+  "policy": {
+    "type": "k8s"
+  },
+  "kubernetes": {
+    "kubeconfig": "__KUBECONFIG_FILEPATH__"
+  }
+}
+```
+
+### 7.3 Pod IP Lifecycle
+
+```bash
+# สร้าง Pod และดู IP allocation
+kubectl run test-pod --image=nginx
+kubectl get pod test-pod -o wide
+
+# ดู IP ในรายละเอียด
+kubectl get pod test-pod -o jsonpath='{.status.podIP}'
+kubectl get pod test-pod -o jsonpath='{.status.podIPs}'
+
+# ดู veth pair บน Node
+# (ต้อง SSH เข้า Node)
+ip link show type veth
+ip addr show | grep -A2 "veth"
+
+# ดู Pod network namespace
+# หา PID ของ container
+docker inspect <container-id> | grep Pid
+# หรือ
+crictl inspect <container-id> | grep pid
+
+# เข้าดู network namespace
+nsenter -t <pid> -n ip addr
+
+# ลบ Pod - IP จะถูก return กลับ
+kubectl delete pod test-pod
+```
+
+---
+
+## 8. iptables Rules ใน Kubernetes {#iptables-k8s}
+
+### 8.1 Overview ของ iptables Chains
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    iptables Flow ใน Kubernetes                   │
+│                                                                   │
+│  Incoming Packet                                                  │
+│       │                                                           │
+│       ▼                                                           │
+│  PREROUTING chain                                                 │
+│  ├── KUBE-SERVICES (ClusterIP DNAT)                              │
+│  │   ├── KUBE-SVC-XXXX → KUBE-SEP-YYYY (endpoint 1)             │
+│  │   └── KUBE-SVC-XXXX → KUBE-SEP-ZZZZ (endpoint 2)             │
+│  └── KUBE-NODEPORTS (NodePort DNAT)                              │
+│       │                                                           │
+│       ▼                                                           │
+│  FORWARD chain                                                    │
+│  └── KUBE-FORWARD (forward packets)                              │
+│       │                                                           │
+│       ▼                                                           │
+│  POSTROUTING chain                                                │
+│  └── KUBE-POSTROUTING (SNAT/Masquerade)                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 ดู iptables Rules ที่ kube-proxy สร้าง
+
+```bash
+# ดู NAT table ทั้งหมด
+iptables -t nat -L -n --line-numbers
+
+# ดู KUBE-SERVICES chain
+iptables -t nat -L KUBE-SERVICES -n --line-numbers
+# ตัวอย่าง output:
+# num   target     prot  opt  source    destination
+# 1     KUBE-SVC-ERIFXISMVVYYFZ3NK tcp  -- 0.0.0.0/0  10.96.0.10  /* kube-dns:dns-tcp */
+# 2     KUBE-SVC-NPX46M4PTMTKRN6Y  tcp  -- 0.0.0.0/0  10.96.0.1   /* default/kubernetes:https */
+
+# ดู Service-specific chain
+SERVICE_CHAIN=$(iptables -t nat -L KUBE-SERVICES -n | grep "my-service" | awk '{print $1}')
+iptables -t nat -L $SERVICE_CHAIN -n --line-numbers
+
+# ดู EndPoint chain (จริงๆ ว่า traffic ไปที่ไหน)
+iptables -t nat -L KUBE-SEP-XXXXXXXXXXXXXXXX -n
+
+# ดู KUBE-NODEPORTS chain
+iptables -t nat -L KUBE-NODEPORTS -n
+
+# ดู iptables stats (packet/byte counts)
+iptables -t nat -L KUBE-SERVICES -n -v
+```
+
+### 8.3 Load Balancing ด้วย iptables
+
+```
+kube-proxy ใช้ statistic module ของ iptables สำหรับ load balancing:
+
+Service มี 3 endpoints:
+- Endpoint 1: probability 1/3 (33%)
+- Endpoint 2: probability 1/2 ของที่เหลือ (33%)
+- Endpoint 3: ที่เหลือทั้งหมด (33%)
+
+Rules ที่สร้าง:
+KUBE-SVC-XXXX
+  → KUBE-SEP-1  statistic mode random probability 0.33333
+  → KUBE-SEP-2  statistic mode random probability 0.50000
+  → KUBE-SEP-3  (default - ที่เหลือ)
+```
+
+```bash
+# ดู Load Balancing rules
+iptables -t nat -L KUBE-SVC-ERIFXISMVVYYFZ3NK -n
+# Output:
+# KUBE-SEP-1  tcp  --  statistic mode random probability 0.33333333349
+# KUBE-SEP-2  tcp  --  statistic mode random probability 0.50000000000
+# KUBE-SEP-3  tcp  --
+
+# นับ packets ที่ผ่านแต่ละ endpoint
+watch -n 1 'iptables -t nat -L KUBE-SVC-XXXX -n -v'
+```
+
+### 8.4 IPVS Mode (แทน iptables)
+
+```bash
+# เปลี่ยน kube-proxy เป็น IPVS mode
+kubectl edit configmap kube-proxy -n kube-system
+# เปลี่ยน mode: "" เป็น mode: "ipvs"
+
+# หรือ patch
+kubectl patch configmap kube-proxy -n kube-system \
+  --type merge \
+  -p '{"data":{"config.conf":"...\nmode: ipvs\n..."}}'
+
+# ดู IPVS rules
+ipvsadm -l -n
+# Output:
+# IP Virtual Server version 1.2.1 (size=4096)
+# Prot LocalAddress:Port Scheduler Flags
+#   -> RemoteAddress:Port    Forward Weight ActiveConn InActConn
+# TCP  10.96.100.1:80 rr
+#   -> 192.168.1.2:8080      Masq    1      0          0
+#   -> 192.168.2.3:8080      Masq    1      0          0
+
+# ดู IPVS stats
+ipvsadm -l -n --stats
+
+# ดู IPVS connections
+ipvsadm -l -n -c
+
+# ดู timeout settings
+ipvsadm -l --timeout
+```
+
+---
+
+## 9. Network Troubleshooting Tools {#network-troubleshooting}
+
+### 9.1 tcpdump
+
+```bash
+# Capture ทุก traffic บน interface
+tcpdump -i eth0 -w capture.pcap
+
+# Capture traffic เฉพาะ Pod IP
+POD_IP=192.168.1.10
+tcpdump -i any host $POD_IP -n
+
+# Capture HTTP traffic
+tcpdump -i eth0 'tcp port 80' -A
+
+# Capture DNS queries
+tcpdump -i any 'port 53' -n
+
+# Capture traffic ระหว่าง 2 hosts
+tcpdump -i eth0 'host 192.168.1.10 and host 192.168.2.20' -n
+
+# Capture VXLAN traffic (Flannel)
+tcpdump -i eth0 'udp port 8472' -n
+
+# Run tcpdump inside Pod
+kubectl exec -it my-pod -- tcpdump -i eth0 -n
+
+# Run tcpdump ด้วย netshoot image
+kubectl run tcpdump --rm -it --image=nicolaka/netshoot \
+  --overrides='{"spec":{"nodeName":"node1","hostNetwork":true}}' \
+  -- tcpdump -i any 'host 192.168.1.10' -n
+
+# Filter และแสดง output ที่อ่านได้
+tcpdump -i eth0 -A -s 0 'tcp port 80 and (tcp[13] & 8 != 0)'
+```
+
+### 9.2 netstat และ ss
+
+```bash
+# ดู listening ports ทั้งหมด
+netstat -tlnp
+ss -tlnp
+
+# ดู established connections
+netstat -tnp | grep ESTABLISHED
+ss -tnp state established
+
+# ดู connections ไป specific service
+ss -tnp | grep ':8080'
+netstat -tnp | grep ':8080'
+
+# ดู socket statistics
+ss -s
+# Output:
+# Total: 500 (kernel 510)
+# TCP:   300 (estab 200, closed 50, orphaned 5, synrecv 0, timewait 45)
+
+# ดู connections จาก Pod
+kubectl exec -it my-pod -- netstat -tnp
+kubectl exec -it my-pod -- ss -tnp
+
+# ดู UDP sockets
+ss -unp
+
+# Monitor connections realtime
+watch -n 1 'ss -s'
+
+# ดู connection states
+ss -tan | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn
+
+# ดู connections ที่ TIME_WAIT (อาจมีปัญหา)
+ss -tan state time-wait | wc -l
+```
+
+### 9.3 ping, traceroute, mtr
+
+```bash
+# ทดสอบ connectivity พื้นฐาน
+kubectl exec -it pod-a -- ping 10.244.1.5 -c 4
+kubectl exec -it pod-a -- ping my-service.default.svc.cluster.local -c 4
+
+# traceroute - ดู path ของ packets
+kubectl exec -it pod-a -- traceroute 10.244.2.10
+kubectl exec -it pod-a -- tracepath google.com
+
+# mtr - combine ping + traceroute
+kubectl exec -it pod-a -- mtr --report google.com
+
+# ดู latency ระหว่าง pods
+kubectl exec -it pod-a -- ping pod-b.default.svc.cluster.local -c 100 | tail -2
+```
+
+### 9.4 nslookup และ dig
+
+```bash
+# ทดสอบ DNS resolution
+kubectl exec -it my-pod -- nslookup kubernetes.default
+kubectl exec -it my-pod -- nslookup my-service.production.svc.cluster.local
+
+# dig - ละเอียดกว่า
+kubectl exec -it my-pod -- dig my-service.default.svc.cluster.local
+kubectl exec -it my-pod -- dig my-service.default.svc.cluster.local +short
+
+# ดู DNS server ที่ Pod ใช้
+kubectl exec -it my-pod -- cat /etc/resolv.conf
+
+# ทดสอบ external DNS
+kubectl exec -it my-pod -- dig google.com @8.8.8.8
+
+# ตรวจสอบ reverse DNS
+kubectl exec -it my-pod -- dig -x 10.96.100.1
+```
+
+### 9.5 curl และ wget สำหรับ HTTP Testing
+
+```bash
+# ทดสอบ HTTP service
+kubectl exec -it my-pod -- curl http://my-service.default.svc.cluster.local
+
+# ดู response headers
+kubectl exec -it my-pod -- curl -I http://my-service
+
+# ดู timing ละเอียด
+kubectl exec -it my-pod -- curl -w "
+dns_lookup:     %{time_namelookup}s
+connect:        %{time_connect}s
+appconnect:     %{time_appconnect}s
+pretransfer:    %{time_pretransfer}s
+redirect:       %{time_redirect}s
+starttransfer:  %{time_starttransfer}s
+total:          %{time_total}s
+" -o /dev/null -s http://my-service
+
+# ทดสอบ HTTPS
+kubectl exec -it my-pod -- curl -k https://my-service
+
+# Test LoadBalancer
+curl -v http://<EXTERNAL-IP>:80
+
+# wget
+kubectl exec -it my-pod -- wget -qO- http://my-service/health
+```
+
+### 9.6 Network Bandwidth Testing
+
+```bash
+# ใช้ iperf3 ทดสอบ bandwidth
+# Server pod
+kubectl run iperf-server --image=networkstatic/iperf3 -- -s -p 5201
+
+# Client pod
+kubectl run iperf-client --rm -it --image=networkstatic/iperf3 \
+  -- -c iperf-server -p 5201 -t 30 -P 4
+
+# ทดสอบ UDP bandwidth
+kubectl run iperf-client --rm -it --image=networkstatic/iperf3 \
+  -- -c iperf-server -u -b 1G -t 30
+
+# ดู network stats บน node
+cat /proc/net/dev
+ip -s link show eth0
+
+# netperf (alternative)
+kubectl run netperf-server --image=henrylv206/k8s-netperf -- netserver
+```
+
+---
+
+## 10. Workshop: Debug Pod Networking {#workshop-debug}
+
+### Workshop Objectives
+
+ในเวิร์กช็อปนี้ จะฝึก debug ปัญหา network จริงๆ ที่พบบ่อยใน Kubernetes
+
+### Scenario 1: Pod ไม่สามารถ reach อีก Pod ได้
+
+```bash
+# สร้าง environment สำหรับทดสอบ
+kubectl create namespace debug-lab
+
+# สร้าง pods
+kubectl run server --image=nginx -n debug-lab
+kubectl run client --image=nicolaka/netshoot -n debug-lab -- sleep 3600
+
+# รอ pods ready
+kubectl wait --for=condition=Ready pod/server pod/client -n debug-lab --timeout=60s
+
+# Step 1: ตรวจสอบ Pod IPs
+kubectl get pods -n debug-lab -o wide
+
+# Step 2: ทดสอบ connectivity
+SERVER_IP=$(kubectl get pod server -n debug-lab -o jsonpath='{.status.podIP}')
+kubectl exec -it client -n debug-lab -- ping $SERVER_IP -c 4
+
+# Step 3: ตรวจสอบ Service
+kubectl expose pod server --port=80 -n debug-lab
+kubectl exec -it client -n debug-lab -- curl http://server.debug-lab.svc.cluster.local
+
+# Step 4: Debug DNS
+kubectl exec -it client -n debug-lab -- nslookup server.debug-lab.svc.cluster.local
+
+# Cleanup
+kubectl delete namespace debug-lab
+```
+
+### Scenario 2: Service ไม่ได้รับ Traffic
+
+```bash
+# สร้าง deployment และ service ที่มีปัญหา (label mismatch)
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web      # label บน Pod
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  selector:
+    app: web-app    # ← label ไม่ตรงกับ Pod!
+  ports:
+  - port: 80
+    targetPort: 80
+EOF
+
+# Debug: ตรวจสอบ endpoints
+kubectl get endpoints web-service
+# ถ้า Endpoints แสดง <none> แสดงว่า label ไม่ match
+
+# วิธีแก้: ดู labels บน pods
+kubectl get pods --show-labels | grep web
+
+# แก้ service selector
+kubectl patch service web-service -p '{"spec":{"selector":{"app":"web"}}}'
+
+# ตรวจสอบอีกครั้ง
+kubectl get endpoints web-service
+
+# Cleanup
+kubectl delete deployment web-app
+kubectl delete service web-service
+```
+
+### Scenario 3: Network Policy Blocking Traffic
+
+```bash
+# สร้าง environment
+kubectl create namespace policy-lab
+kubectl label namespace policy-lab tier=production
+
+# สร้าง pods
+kubectl run backend --image=nginx -n policy-lab -l app=backend
+kubectl run frontend --image=nicolaka/netshoot -n policy-lab -l app=frontend -- sleep 3600
+kubectl run attacker --image=nicolaka/netshoot -n policy-lab -l app=attacker -- sleep 3600
+
+# สร้าง service
+kubectl expose pod backend --port=80 -n policy-lab
+
+# ทดสอบ: ตอนนี้ทุกคน reach ได้
+kubectl exec -it frontend -n policy-lab -- curl backend.policy-lab.svc.cluster.local
+kubectl exec -it attacker -n policy-lab -- curl backend.policy-lab.svc.cluster.local
+
+# สร้าง Network Policy
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-policy
+  namespace: policy-lab
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend   # อนุญาตเฉพาะ frontend
+    ports:
+    - protocol: TCP
+      port: 80
+EOF
+
+# ทดสอบ: frontend ยังใช้ได้
+kubectl exec -it frontend -n policy-lab -- curl backend.policy-lab.svc.cluster.local
+
+# ทดสอบ: attacker ถูกบล็อก
+kubectl exec -it attacker -n policy-lab -- curl --connect-timeout 5 backend.policy-lab.svc.cluster.local
+# ควรจะ timeout
+
+# Debug: ดู Network Policies
+kubectl get networkpolicies -n policy-lab
+kubectl describe networkpolicy backend-policy -n policy-lab
+
+# Cleanup
+kubectl delete namespace policy-lab
+```
+
+### Scenario 4: DNS Resolution ล้มเหลว
+
+```bash
+# Debug DNS ทีละขั้นตอน
+
+# 1. ตรวจสอบ CoreDNS pods
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=30
+
+# 2. ตรวจสอบ CoreDNS service
+kubectl get service kube-dns -n kube-system
+
+# 3. สร้าง debug pod
+kubectl run dns-debug --rm -it --image=nicolaka/netshoot -- bash
+
+# ภายใน pod:
+# 4. ดู resolv.conf
+cat /etc/resolv.conf
+# Expected: nameserver 10.96.0.10
+
+# 5. ทดสอบ DNS resolution
+nslookup kubernetes.default.svc.cluster.local
+nslookup kubernetes.default
+nslookup kubernetes
+
+# 6. ถ้า DNS ล้มเหลว ตรวจสอบ CoreDNS
+kubectl describe configmap coredns -n kube-system
+
+# 7. ทดสอบ DNS โดยตรง
+dig @10.96.0.10 kubernetes.default.svc.cluster.local
+
+# 8. ดู DNS latency
+time nslookup google.com
+
+# แก้ปัญหา CoreDNS Loop
+kubectl edit configmap coredns -n kube-system
+# เพิ่ม: loop (disable loop detection)
+
+# หรือ restart CoreDNS
+kubectl rollout restart deployment coredns -n kube-system
+```
+
+---
+
+## 11. แบบฝึกหัด Kubernetes Networking {#exercises}
+
+### แบบฝึกหัดที่ 1: ตรวจสอบ CNI Configuration
+
+**วัตถุประสงค์:** เข้าใจ CNI ที่ cluster ใช้งานอยู่
+
+**คำสั่ง:**
+```bash
+# 1. หา CNI ที่ใช้งานอยู่
+ls /etc/cni/net.d/
+
+# 2. อ่าน CNI configuration
+cat /etc/cni/net.d/*.conf* 2>/dev/null || cat /etc/cni/net.d/*.json 2>/dev/null
+
+# 3. ดู Pod CIDR ของแต่ละ Node
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'
+
+# 4. ดู CNI binaries
+ls /opt/cni/bin/
+
+# 5. ดูว่า CNI DaemonSet ชื่ออะไร
+kubectl get daemonsets --all-namespaces | grep -E 'calico|flannel|cilium|weave|canal'
+```
+
+**คำถาม:**
+- Cluster ของคุณใช้ CNI อะไร?
+- Pod CIDR range คืออะไร?
+- CNI binary ไหนที่มีอยู่?
+
+---
+
+### แบบฝึกหัดที่ 2: ทดสอบ Pod-to-Pod Communication
+
+**วัตถุประสงค์:** ยืนยันว่า Pods สามารถคุยกันได้ทั้งบน Node เดียวกันและต่าง Node
+
+```bash
+# สร้าง 2 pods บน nodes ต่างกัน
+NODE1=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+NODE2=$(kubectl get nodes -o jsonpath='{.items[1].metadata.name}')
+
+kubectl run pod1 --image=nicolaka/netshoot \
+  --overrides="{\"spec\":{\"nodeName\":\"$NODE1\"}}" \
+  -- sleep 3600
+
+kubectl run pod2 --image=nicolaka/netshoot \
+  --overrides="{\"spec\":{\"nodeName\":\"$NODE2\"}}" \
+  -- sleep 3600
+
+# รอ pods ready
+kubectl wait --for=condition=Ready pod/pod1 pod/pod2 --timeout=60s
+
+# ดู IPs
+kubectl get pods -o wide
+
+# ทดสอบ connectivity
+POD2_IP=$(kubectl get pod pod2 -o jsonpath='{.status.podIP}')
+kubectl exec pod1 -- ping $POD2_IP -c 4
+
+# ดู route ที่ใช้
+kubectl exec pod1 -- traceroute $POD2_IP
+
+# Cleanup
+kubectl delete pod pod1 pod2
+```
+
+---
+
+### แบบฝึกหัดที่ 3: วิเคราะห์ iptables Rules
+
+**วัตถุประสงค์:** เข้าใจว่า kube-proxy สร้าง iptables rules อย่างไร
+
+```bash
+# สร้าง service
+kubectl create deployment web --image=nginx --replicas=3
+kubectl expose deployment web --port=80 --target-port=80
+
+# ดู ClusterIP ของ service
+CLUSTER_IP=$(kubectl get service web -o jsonpath='{.spec.clusterIP}')
+echo "ClusterIP: $CLUSTER_IP"
+
+# ดู iptables rules สำหรับ service นี้
+iptables -t nat -L KUBE-SERVICES -n | grep $CLUSTER_IP
+
+# หา chain ของ service
+SVC_CHAIN=$(iptables -t nat -L KUBE-SERVICES -n | grep $CLUSTER_IP | awk '{print $1}')
+echo "Service Chain: $SVC_CHAIN"
+
+# ดู endpoints ใน chain นั้น
+iptables -t nat -L $SVC_CHAIN -n --line-numbers
+
+# ดู endpoint chain (จะเห็น real pod IP)
+EP_CHAIN=$(iptables -t nat -L $SVC_CHAIN -n | grep KUBE-SEP | head -1 | awk '{print $1}')
+iptables -t nat -L $EP_CHAIN -n
+
+# Cleanup
+kubectl delete deployment web
+kubectl delete service web
+```
+
+---
+
+### แบบฝึกหัดที่ 4: สร้างและทดสอบ Network Policy
+
+**วัตถุประสงค์:** ควบคุม traffic ด้วย Network Policy
+
+```bash
+# Setup
+kubectl create namespace netpol-test
+
+# สร้าง backend
+kubectl create deployment backend --image=nginx -n netpol-test
+kubectl expose deployment backend --port=80 -n netpol-test
+
+# สร้าง frontend และ other
+kubectl run frontend --image=nicolaka/netshoot -n netpol-test -l tier=frontend -- sleep 3600
+kubectl run other --image=nicolaka/netshoot -n netpol-test -l tier=other -- sleep 3600
+
+# รอทุก pod ready
+kubectl wait --for=condition=Ready pods --all -n netpol-test --timeout=60s
+
+# ทดสอบก่อนมี policy (ทุกคน reach ได้)
+kubectl exec frontend -n netpol-test -- curl -s --max-time 5 backend.netpol-test.svc.cluster.local | head -5
+kubectl exec other -n netpol-test -- curl -s --max-time 5 backend.netpol-test.svc.cluster.local | head -5
+
+# สร้าง Network Policy
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-policy
+  namespace: netpol-test
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: frontend
+    ports:
+    - protocol: TCP
+      port: 80
+EOF
+
+# ทดสอบหลังมี policy
+echo "Frontend (ควรสำเร็จ):"
+kubectl exec frontend -n netpol-test -- curl -s --max-time 5 backend.netpol-test.svc.cluster.local | head -3
+
+echo "Other (ควร timeout):"
+kubectl exec other -n netpol-test -- curl -s --max-time 5 backend.netpol-test.svc.cluster.local || echo "Blocked!"
+
+# Cleanup
+kubectl delete namespace netpol-test
+```
+
+---
+
+## 12. เฉลยแบบฝึกหัด {#answers}
+
+### เฉลยแบบฝึกหัดที่ 1
+
+```bash
+# ตัวอย่าง output สำหรับ Flannel cluster:
+# /etc/cni/net.d/10-flannel.conflist
+
+# Pod CIDR ตัวอย่าง:
+# node1   10.244.0.0/24
+# node2   10.244.1.0/24
+# node3   10.244.2.0/24
+
+# CNI binaries ที่ควรมี:
+# /opt/cni/bin/flannel
+# /opt/cni/bin/bridge
+# /opt/cni/bin/host-local
+# /opt/cni/bin/loopback
+# /opt/cni/bin/portmap
+
+# ตัวอย่าง output สำหรับ Calico:
+# /etc/cni/net.d/10-calico.conflist
+# DaemonSet: calico-node (namespace: calico-system หรือ kube-system)
+```
+
+### เฉลยแบบฝึกหัดที่ 2
+
+```
+ผลที่คาดหวัง:
+- ping จาก pod1 ไป pod2 ควรสำเร็จ (0% packet loss)
+- PING 10.244.2.5 (10.244.2.5) 56(84) bytes of data.
+  64 bytes from 10.244.2.5: icmp_seq=1 ttl=62 time=0.512 ms
+  64 bytes from 10.244.2.5: icmp_seq=2 ttl=62 time=0.432 ms
+
+- traceroute แสดง path ผ่าน Node IP:
+  1  10.244.0.1 (gateway บน node1)  0.123 ms
+  2  192.168.1.11 (node2 IP)         0.456 ms  ← ผ่าน Node
+  3  10.244.2.5 (pod2)               0.789 ms
+
+หมายเหตุ: TTL=62 แสดงว่า packet ผ่าน 2 hops (pod1 → node1 → node2 → pod2)
+```
+
+### เฉลยแบบฝึกหัดที่ 3
+
+```bash
+# ClusterIP: 10.96.150.200 (ตัวอย่าง)
+
+# KUBE-SERVICES output ตัวอย่าง:
+# KUBE-SVC-LOLE4ISW44CQNEXN  tcp  -- 0.0.0.0/0  10.96.150.200  /* default/web:80 */
+
+# Service Chain (KUBE-SVC-XXXX) output:
+# KUBE-SEP-AAA  tcp  -- statistic mode random probability 0.33333
+# KUBE-SEP-BBB  tcp  -- statistic mode random probability 0.50000
+# KUBE-SEP-CCC  tcp  --
+
+# Endpoint Chain output:
+# DNAT tcp -- 0.0.0.0/0 0.0.0.0/0  to:192.168.1.10:80
+
+# สังเกต: DNAT ชี้ไปที่ Pod IP โดยตรง
+# ทั้ง 3 endpoints มี probability เท่ากันสำหรับ 3 replicas
+```
+
+### เฉลยแบบฝึกหัดที่ 4
+
+```
+ผลที่คาดหวัง:
+
+Frontend curl:
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+
+Other curl:
+curl: (28) Connection timed out after 5000 milliseconds
+Blocked!
+
+ทำไม timeout ไม่ใช่ Connection Refused?
+- Network Policy ทำงานที่ level iptables/eBPF
+- Packets ถูก drop (ไม่มี RST packet ส่งกลับ)
+- ดังนั้น client เห็นเป็น timeout แทนที่จะเป็น refused
+
+Debug เพิ่มเติม:
+kubectl get networkpolicies -n netpol-test
+kubectl describe networkpolicy backend-policy -n netpol-test
+kubectl get endpoints backend -n netpol-test
+```
+
+---
+
+## แหล่งข้อมูลเพิ่มเติม
+
+- [Kubernetes Networking Documentation](https://kubernetes.io/docs/concepts/cluster-administration/networking/)
+- [CNI Specification](https://github.com/containernetworking/cni)
+- [Calico Documentation](https://docs.tigera.io/calico/latest/)
+- [Flannel GitHub](https://github.com/flannel-io/flannel)
+- [Cilium Documentation](https://docs.cilium.io/)
+- [Hubble - Cilium Observability](https://docs.cilium.io/en/stable/overview/intro/)
+- [iptables Tutorial](https://www.frozentux.net/iptables-tutorial/iptables-tutorial.html)
+- [Linux Networking Tools](https://linux.die.net/man/8/ss)
+
+---
+
+*ต่อไป: [Part 32 - ClusterIP Service](./part-32-clusterip.md)*

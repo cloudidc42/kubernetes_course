@@ -921,3 +921,614 @@ Annotations เป็นส่วนสำคัญของ Kubernetes metadata
 - Document ว่า annotation แต่ละตัวหมายความว่าอะไร
 
 ในบทต่อไปเราจะเรียนรู้ **ConfigMaps** ซึ่งใช้เก็บ configuration data สำหรับ Applications
+
+---
+
+## Annotations ที่ใช้บ่อยใน Production
+
+### 1. Build และ CI/CD Annotations
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: production-app
+  annotations:
+    # Build information
+    build.ci/pipeline-id: "pipeline-2024-001"
+    build.ci/run-id: "run-45678"
+    build.ci/commit-sha: "abc123def456"
+    build.ci/branch: "main"
+    build.ci/build-time: "2024-01-15T10:30:00Z"
+    build.ci/builder: "jenkins/2.387"
+    
+    # Docker image info
+    image.registry/digest: "sha256:abc123..."
+    image.registry/pushed-at: "2024-01-15T10:25:00Z"
+    
+    # Deployment info
+    deployment.info/deployed-by: "john.doe@company.com"
+    deployment.info/deployed-at: "2024-01-15T10:30:00Z"
+    deployment.info/ticket: "JIRA-1234"
+    deployment.info/changelog: "Fix critical security vulnerability CVE-2024-001"
+```
+
+### 2. Monitoring และ Alerting Annotations
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  annotations:
+    # Prometheus scraping
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+    prometheus.io/scheme: "http"
+    
+    # Alert routing
+    alert.pagerduty.com/service-id: "PXXXXXX"
+    alert.pagerduty.com/escalation-policy: "default"
+    alert.opsgenie.com/team: "backend-team"
+    
+    # SLA information
+    sla.company.io/tier: "tier-1"
+    sla.company.io/availability: "99.9"
+    sla.company.io/rto: "15m"
+    sla.company.io/rpo: "1h"
+```
+
+### 3. Networking และ Ingress Annotations
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  annotations:
+    # Nginx Ingress Controller
+    nginx.ingress.kubernetes.io/rewrite-target: "/"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+    
+    # CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.company.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE"
+    
+    # Certificate management (cert-manager)
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    cert-manager.io/acme-challenge-type: "http01"
+spec:
+  tls:
+  - hosts:
+    - api.company.com
+    secretName: api-tls-cert
+  rules:
+  - host: api.company.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+### 4. Service Mesh Annotations (Istio)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: microservice
+  annotations:
+    # Istio sidecar injection
+    sidecar.istio.io/inject: "true"
+    sidecar.istio.io/proxyCPU: "100m"
+    sidecar.istio.io/proxyMemory: "128Mi"
+    sidecar.istio.io/proxyCPULimit: "500m"
+    sidecar.istio.io/proxyMemoryLimit: "256Mi"
+    
+    # Traffic management
+    traffic.sidecar.istio.io/excludeOutboundPorts: "3306"
+    
+    # Tracing
+    sidecar.jaegertracing.io/inject: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        # Per-pod Istio settings
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+```
+
+### 5. Cluster Autoscaler Annotations
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: critical-pod
+  annotations:
+    # ห้าม Cluster Autoscaler scale down node ที่รัน pod นี้
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+```
+
+```yaml
+apiVersion: v1
+kind: Node
+metadata:
+  name: worker-node-01
+  annotations:
+    # ปิด scale down สำหรับ node นี้
+    cluster-autoscaler.kubernetes.io/scale-down-disabled: "true"
+    # กำหนด node group
+    cluster-autoscaler.kubernetes.io/node-group: "high-memory-nodes"
+```
+
+---
+
+## Tool-specific Annotations
+
+### kubectl.kubernetes.io/last-applied-configuration
+
+เมื่อใช้ `kubectl apply` Kubernetes จะเก็บ manifest ล่าสุดไว้ใน annotation นี้
+
+```bash
+# ดู last-applied-configuration
+kubectl get deployment my-deploy \
+    -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}' \
+    | jq .
+
+# Annotation นี้ใช้สำหรับ:
+# 1. Three-way merge เมื่อ apply ครั้งต่อไป
+# 2. ตรวจสอบว่า field ใดถูก manage โดย kubectl
+# 3. ลบ fields ที่หายไปจาก manifest
+
+# ลบ annotation นี้ถ้าต้องการ (ไม่แนะนำ)
+kubectl annotate deployment my-deploy \
+    kubectl.kubernetes.io/last-applied-configuration-
+```
+
+### kubernetes.io/change-cause
+
+ใช้สำหรับ deployment history และ rollback
+
+```bash
+# ตั้ง change-cause ก่อน deploy
+kubectl annotate deployment my-deploy \
+    kubernetes.io/change-cause="Deploy version 2.0: add payment gateway" \
+    --overwrite
+
+# หรือตั้งระหว่าง apply
+kubectl apply -f deployment.yaml
+kubectl annotate deployment my-deploy \
+    kubernetes.io/change-cause="v2.0: new features" \
+    --overwrite
+
+# ดู rollout history พร้อม change-cause
+kubectl rollout history deployment/my-deploy
+
+# Output:
+# REVISION  CHANGE-CAUSE
+# 1         Deploy version 1.0: initial release
+# 2         Deploy version 2.0: add payment gateway
+# 3         v2.0: new features
+
+# Rollback ไปเวอร์ชันเก่า
+kubectl rollout undo deployment/my-deploy --to-revision=2
+```
+
+### deployment.kubernetes.io/revision
+
+```bash
+# Annotation นี้ manage อัตโนมัติโดย Kubernetes
+# ดู revision ปัจจุบัน
+kubectl get deployment my-deploy \
+    -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}'
+
+# ดูใน ReplicaSet ด้วย
+kubectl get rs \
+    -l app=my-deploy \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}'
+```
+
+### autoscaling Annotations
+
+```yaml
+# HPA v2 สามารถใช้ annotations สำหรับ custom behavior
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-hpa
+  annotations:
+    autoscaling.alpha.kubernetes.io/conditions: |
+      [{"type":"AbleToScale","status":"True"}]
+    autoscaling.alpha.kubernetes.io/metrics: |
+      [{"type":"Resource","resource":{"name":"cpu","currentAverageUtilization":45}}]
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-deploy
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+---
+
+## Custom Annotations สำหรับ Internal Tools
+
+### 1. Annotation Schema สำหรับองค์กร
+
+```yaml
+# กำหนด standard annotations ขององค์กร
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-service
+  annotations:
+    # === Organization Info ===
+    company.io/team: "backend"
+    company.io/owner: "john.doe@company.com"
+    company.io/slack-channel: "#backend-alerts"
+    company.io/runbook: "https://wiki.company.io/runbook/my-service"
+    company.io/repo: "https://github.com/company/my-service"
+    
+    # === Compliance ===
+    compliance.company.io/data-classification: "confidential"
+    compliance.company.io/pii-data: "false"
+    compliance.company.io/gdpr-relevant: "true"
+    compliance.company.io/last-security-review: "2024-01-01"
+    
+    # === Operations ===
+    ops.company.io/maintenance-window: "Sunday 02:00-04:00 UTC"
+    ops.company.io/backup-schedule: "daily"
+    ops.company.io/dr-tier: "tier-1"
+    ops.company.io/critical: "true"
+    
+    # === Cost ===
+    cost.company.io/center: "CC-1234"
+    cost.company.io/project: "project-alpha"
+    cost.company.io/budget-code: "BUDGET-2024-001"
+```
+
+### 2. Annotation สำหรับ Deployment Pipeline
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  annotations:
+    # GitOps annotations (ArgoCD)
+    argocd.argoproj.io/managed-by: "argocd"
+    argocd.argoproj.io/app-name: "api-service"
+    
+    # Flux annotations
+    fluxcd.io/automated: "true"
+    fluxcd.io/tag.api: "semver:~2.0"
+    filter.fluxcd.io/api: "semver:^2.0.0"
+    
+    # Helm annotations
+    meta.helm.sh/release-name: "api-service"
+    meta.helm.sh/release-namespace: "production"
+    helm.sh/chart: "api-service-1.5.0"
+```
+
+### 3. Script จัดการ Annotations
+
+```bash
+#!/bin/bash
+# annotate-resources.sh - เพิ่ม standard annotations ให้ resources ทั้งหมด
+
+NAMESPACE="${1:-default}"
+TEAM="${2:-default-team}"
+OWNER="${3:-ops@company.com}"
+
+echo "Adding standard annotations to resources in namespace: $NAMESPACE"
+
+# เพิ่ม annotations ให้ Deployments
+for deploy in $(kubectl get deployments -n "$NAMESPACE" -o name); do
+  kubectl annotate "$deploy" \
+      -n "$NAMESPACE" \
+      company.io/team="$TEAM" \
+      company.io/owner="$OWNER" \
+      company.io/annotated-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --overwrite
+  echo "Annotated: $deploy"
+done
+
+# เพิ่ม annotations ให้ Services
+for svc in $(kubectl get services -n "$NAMESPACE" -o name); do
+  kubectl annotate "$svc" \
+      -n "$NAMESPACE" \
+      company.io/team="$TEAM" \
+      company.io/owner="$OWNER" \
+      --overwrite
+  echo "Annotated: $svc"
+done
+
+echo "Done! Annotated resources in $NAMESPACE"
+```
+
+### 4. Validation Script
+
+```bash
+#!/bin/bash
+# validate-annotations.sh - ตรวจสอบว่า resources มี required annotations
+
+REQUIRED_ANNOTATIONS=(
+  "company.io/team"
+  "company.io/owner"
+  "company.io/runbook"
+)
+
+NAMESPACE="${1:-production}"
+FAILED=0
+
+echo "Checking required annotations in namespace: $NAMESPACE"
+echo "Required: ${REQUIRED_ANNOTATIONS[*]}"
+echo ""
+
+for deploy in $(kubectl get deployments -n "$NAMESPACE" -o name); do
+  MISSING=()
+  for ann in "${REQUIRED_ANNOTATIONS[@]}"; do
+    value=$(kubectl get "$deploy" -n "$NAMESPACE" \
+        -o jsonpath="{.metadata.annotations.$ann}" 2>/dev/null)
+    if [ -z "$value" ]; then
+      MISSING+=("$ann")
+    fi
+  done
+  
+  if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "FAIL: $deploy"
+    echo "  Missing annotations: ${MISSING[*]}"
+    FAILED=$((FAILED + 1))
+  else
+    echo "PASS: $deploy"
+  fi
+done
+
+echo ""
+if [ $FAILED -gt 0 ]; then
+  echo "FAILED: $FAILED resources missing required annotations"
+  exit 1
+else
+  echo "All resources have required annotations"
+fi
+```
+
+---
+
+## แบบฝึกหัด: Annotations
+
+### แบบฝึกหัดที่ 1: เพิ่ม Build Annotations
+
+**โจทย์**: เพิ่ม annotations เกี่ยวกับ build info ให้ Deployment
+
+**เฉลย**:
+```bash
+# สร้าง Deployment ก่อน
+kubectl create deployment my-app --image=nginx
+
+# เพิ่ม annotations ด้วย kubectl annotate
+kubectl annotate deployment my-app \
+    build.ci/commit="abc123" \
+    build.ci/branch="main" \
+    build.ci/pipeline="pipeline-001" \
+    deployment.info/deployed-by="john@company.com" \
+    deployment.info/deployed-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# ตรวจสอบ
+kubectl describe deployment my-app | grep -A10 "Annotations:"
+```
+
+---
+
+### แบบฝึกหัดที่ 2: Annotation สำหรับ Prometheus Scraping
+
+**โจทย์**: ตั้ง annotations ให้ Pod เพื่อให้ Prometheus scrape metrics
+
+**เฉลย**:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metrics-app
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+spec:
+  containers:
+  - name: app
+    image: nginx:1.21
+    ports:
+    - containerPort: 80
+      name: http
+    - containerPort: 9090
+      name: metrics
+```
+
+```bash
+kubectl apply -f - << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metrics-app
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+spec:
+  containers:
+  - name: app
+    image: nginx:1.21
+EOF
+
+# ตรวจสอบ annotations
+kubectl get pod metrics-app \
+    -o jsonpath='{.metadata.annotations}' | jq
+```
+
+---
+
+### แบบฝึกหัดที่ 3: ใช้ change-cause สำหรับ Rollout History
+
+**โจทย์**: Deploy application 3 versions พร้อม change-cause แล้วดู history
+
+**เฉลย**:
+```bash
+# Deploy version 1
+kubectl create deployment rollout-demo \
+    --image=nginx:1.19
+kubectl annotate deployment rollout-demo \
+    kubernetes.io/change-cause="Initial deployment: nginx 1.19"
+
+# Deploy version 2
+kubectl set image deployment/rollout-demo \
+    nginx=nginx:1.20
+kubectl annotate deployment rollout-demo \
+    kubernetes.io/change-cause="Upgrade: nginx 1.20 - security patch" \
+    --overwrite
+
+# Deploy version 3
+kubectl set image deployment/rollout-demo \
+    nginx=nginx:1.21
+kubectl annotate deployment rollout-demo \
+    kubernetes.io/change-cause="Upgrade: nginx 1.21 - latest stable" \
+    --overwrite
+
+# ดู history
+kubectl rollout history deployment/rollout-demo
+# REVISION  CHANGE-CAUSE
+# 1         Initial deployment: nginx 1.19
+# 2         Upgrade: nginx 1.20 - security patch
+# 3         Upgrade: nginx 1.21 - latest stable
+
+# Rollback ไป version 2
+kubectl rollout undo deployment/rollout-demo --to-revision=2
+```
+
+---
+
+### แบบฝึกหัดที่ 4: ลบ Annotation
+
+**โจทย์**: ลบ annotations ที่ไม่ต้องการออกจาก Deployment
+
+**เฉลย**:
+```bash
+# ดู annotations ที่มี
+kubectl get deployment my-app \
+    -o jsonpath='{.metadata.annotations}' | jq keys
+
+# ลบ annotation เฉพาะตัว (ใส่ - ท้ายชื่อ)
+kubectl annotate deployment my-app \
+    build.ci/pipeline-
+
+# ลบหลาย annotations พร้อมกัน
+kubectl annotate deployment my-app \
+    build.ci/commit- \
+    build.ci/branch-
+
+# ตรวจสอบ
+kubectl get deployment my-app \
+    -o jsonpath='{.metadata.annotations}' | jq
+```
+
+---
+
+### แบบฝึกหัดที่ 5: Nginx Ingress Annotations
+
+**โจทย์**: สร้าง Ingress ที่มี rate limiting และ SSL redirect ด้วย annotations
+
+**เฉลย**:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  annotations:
+    # Nginx controller
+    kubernetes.io/ingress.class: "nginx"
+    # SSL
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+    # Timeout
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # Body size
+    nginx.ingress.kubernetes.io/proxy-body-size: "5m"
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+---
+
+## สรุปทบทวน Annotations
+
+### Cheat Sheet
+
+```bash
+# เพิ่ม annotation
+kubectl annotate <resource> <name> key=value
+
+# เพิ่ม/อัพเดต (overwrite)
+kubectl annotate <resource> <name> key=value --overwrite
+
+# ลบ annotation
+kubectl annotate <resource> <name> key-
+
+# ดู annotations
+kubectl describe <resource> <name> | grep -A20 Annotations:
+kubectl get <resource> <name> -o jsonpath='{.metadata.annotations}'
+
+# ดู annotation เฉพาะตัว
+kubectl get <resource> <name> \
+    -o jsonpath='{.metadata.annotations.KEY}'
+```
+
+### Annotations vs Labels - สรุปความแตกต่าง
+
+| Feature | Labels | Annotations |
+|---------|--------|-------------|
+| ใช้เลือก Resources | ใช่ | ไม่ |
+| ขนาด value | จำกัด | ใหญ่ได้ (structured data) |
+| ใช้ใน Selector | ใช่ | ไม่ |
+| ใช้เก็บ metadata | ได้ | ได้ (เหมาะกว่า) |
+| Tool integration | บางส่วน | หลักๆ |
+
+Annotations เป็น metadata layer ที่ช่วยให้ ecosystem tools เช่น Ingress controllers, monitoring systems, service meshes และ CI/CD pipelines สามารถ configure behavior ของ Kubernetes resources ได้อย่างยืดหยุ่น

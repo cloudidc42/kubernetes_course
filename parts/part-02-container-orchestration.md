@@ -825,3 +825,970 @@ Kubernetes Ecosystem มีเครื่องมือครอบคลุ�
 ---
 
 *ต่อไป: [Part 03: Docker Fundamentals 1](./part-03-docker-fundamentals-1.md)*
+
+---
+
+## ปัญหา "Works on My Machine" แบบ Detailed
+
+### สาเหตุของปัญหา
+
+ปัญหา "Works on My Machine" เกิดจากความแตกต่างระหว่าง Environment ต่างๆ ซึ่งมีหลายระดับ:
+
+```
+Level 1: OS Differences
+┌────────────────────────────────────────────────────────────────┐
+│  Developer Machine        Production Server                     │
+│  ─────────────────        ────────────────                      │
+│  macOS 14.2               Ubuntu 22.04 LTS                     │
+│  arm64 (Apple M2)         x86_64                               │
+│  Case-insensitive FS      Case-sensitive FS ← Bug!             │
+│  /usr/local/bin/python3   /usr/bin/python3  ← Path ต่างกัน!   │
+└────────────────────────────────────────────────────────────────┘
+
+Level 2: Runtime Version Differences
+┌────────────────────────────────────────────────────────────────┐
+│  Developer Machine        Staging Server    Production Server  │
+│  ─────────────────        ─────────────     ────────────────   │
+│  Node.js 20.11.0          Node.js 18.19.0   Node.js 16.20.0  │
+│  Python 3.12              Python 3.10       Python 3.8        │
+│  Go 1.22                  Go 1.21           Go 1.19           │
+│  Java 21                  Java 17           Java 11           │
+└────────────────────────────────────────────────────────────────┘
+
+Level 3: Dependency Version Conflicts
+┌────────────────────────────────────────────────────────────────┐
+│  Developer: npm install → ได้ lodash@4.17.21                  │
+│  Staging:   npm install → ได้ lodash@4.17.20 (สัปดาห์ก่อน)  │
+│  Production: npm install → ได้ lodash@4.17.19 (เดือนก่อน)   │
+│                                                                 │
+│  หรือ Transitive Dependencies:                                 │
+│  App → lib-a@1.0 → dep-x@2.0                                  │
+│  App → lib-b@2.0 → dep-x@3.0 ← Version Conflict!             │
+└────────────────────────────────────────────────────────────────┘
+
+Level 4: System Library Differences
+┌────────────────────────────────────────────────────────────────┐
+│  Developer: glibc 2.35 (Ubuntu 22.04)                         │
+│  Production: glibc 2.17 (CentOS 7) ← ไม่รองรับ binary ใหม่! │
+│                                                                 │
+│  OpenSSL Version:                                              │
+│  Developer: OpenSSL 3.0                                        │
+│  Production: OpenSSL 1.1 ← TLS configuration ต่างกัน!        │
+└────────────────────────────────────────────────────────────────┘
+
+Level 5: Configuration Differences
+┌────────────────────────────────────────────────────────────────┐
+│  Developer .env:              Production env:                   │
+│  DATABASE_URL=localhost:5432  DATABASE_URL=prod-db:5432       │
+│  DEBUG=true                   DEBUG=false                      │
+│  LOG_LEVEL=debug              LOG_LEVEL=error                  │
+│  CACHE_TTL=0 ← Disable Cache  CACHE_TTL=3600 ← Cache 1 ชั่วโมง│
+└────────────────────────────────────────────────────────────────┘
+```
+
+### ผลกระทบที่เกิดขึ้นจริง
+
+```
+Real-world Examples:
+
+1. ปัญหา Case Sensitivity (macOS vs Linux)
+   ────────────────────────────────────────
+   // ใน code:
+   import MyComponent from './mycomponent'  ← ใช้งานได้บน macOS
+   // ไฟล์จริงชื่อ: MyComponent.tsx
+   
+   บน Linux: Error - Cannot find module './mycomponent'
+   บน macOS: ทำงานปกติ (case-insensitive FS)
+
+2. ปัญหา Line Endings (Windows vs Linux)
+   ────────────────────────────────────────
+   Shell script ใน Windows: บรรทัดจบด้วย \r\n (CRLF)
+   บน Linux: bash: ./run.sh: /bin/bash^M: bad interpreter
+   
+   ^M คือ \r ที่ Linux ไม่เข้าใจ!
+
+3. ปัญหา Timezone
+   ────────────────
+   Developer: TZ=Asia/Bangkok (UTC+7)
+   Production: TZ=UTC
+   
+   Code: new Date().toLocaleDateString()
+   Dev: "1/15/2024" (Bangkok time)
+   Prod: "1/14/2024" (UTC time) ← ผิด 1 วัน!
+
+4. ปัญหา CPU Architecture
+   ────────────────────────
+   Developer: Apple M2 (arm64)
+   Production: AWS EC2 (x86_64)
+   
+   Binary ที่ Compile บน arm64 รันบน x86_64 ไม่ได้!
+   Docker build --platform linux/amd64 ← ต้อง specify!
+```
+
+### แนวทางแก้ไขที่ดีที่สุด
+
+```
+ระดับความสมบูรณ์ของการแก้ไข:
+
+Level 1 - Baseline (Docker):
+┌─────────────────────────────────────────────────────────────┐
+│  ใช้ Docker Container                                        │
+│  ✓ OS และ Runtime เดียวกัน                                  │
+│  ✗ ยังต้องจัดการ Config เอง                                │
+│  ✗ ยังต้องจัดการ Dependencies ระหว่าง Services เอง          │
+└─────────────────────────────────────────────────────────────┘
+
+Level 2 - Better (Docker Compose):
+┌─────────────────────────────────────────────────────────────┐
+│  ใช้ Docker Compose                                          │
+│  ✓ OS, Runtime, Multi-services เดียวกัน                    │
+│  ✓ Config Management ด้วย env files                         │
+│  ✗ ยังไม่มี Production-grade HA                             │
+│  ✗ ไม่ Auto-scale                                           │
+└─────────────────────────────────────────────────────────────┘
+
+Level 3 - Best (Kubernetes):
+┌─────────────────────────────────────────────────────────────┐
+│  ใช้ Kubernetes                                              │
+│  ✓ ทุกอย่างเหมือนกัน Dev → Staging → Production             │
+│  ✓ ConfigMaps และ Secrets จัดการ Config                     │
+│  ✓ Health Checks, Auto-healing                              │
+│  ✓ Auto-scaling                                             │
+│  ✓ Rolling Updates Zero-downtime                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Comparison Table ละเอียด: K8s vs Docker Swarm vs Nomad vs OpenShift
+
+### Overview Comparison
+
+| คุณสมบัติ | Kubernetes | Docker Swarm | HashiCorp Nomad | OpenShift |
+|-----------|------------|--------------|-----------------|-----------|
+| ผู้พัฒนา | Google/CNCF | Docker Inc. | HashiCorp | Red Hat |
+| เปิดตัวปี | 2014 | 2015 | 2015 | 2011 |
+| License | Apache 2.0 | Apache 2.0 | MPL 2.0 | Apache 2.0 + Enterprise |
+| Market Share | ~80% | ~10% | ~5% | ~5% |
+| GitHub Stars | 107k+ | 7k+ | 14k+ | 9k+ |
+| Complexity | สูง | ต่ำ | ปานกลาง | สูงมาก |
+| Learning Curve | ชัน | ราบ | ปานกลาง | ชันมาก |
+
+### Technical Comparison
+
+| คุณสมบัติ | Kubernetes | Docker Swarm | Nomad | OpenShift |
+|-----------|------------|--------------|-------|-----------|
+| **Scheduling** | | | | |
+| Workload Types | Containers | Containers | Containers, VMs, Jobs | Containers |
+| Custom Schedulers | ✓ | ✗ | ✓ | ✓ |
+| Gang Scheduling | ✓ (DRA) | ✗ | ✓ | ✓ |
+| GPU Support | ✓ | ✗ | ✓ | ✓ |
+| **Networking** | | | | |
+| Built-in DNS | ✓ | ✓ | ✓ | ✓ |
+| Network Policies | ✓ | ✗ | ✓ | ✓ |
+| Ingress Controller | ✓ | Limited | ✓ | ✓ (HAProxy/F5) |
+| Service Mesh | Istio/Linkerd | ✗ | Consul Connect | Istio (built-in) |
+| **Storage** | | | | |
+| Persistent Volumes | ✓ | ✓ | ✓ | ✓ |
+| Storage Classes | ✓ | ✗ | ✓ | ✓ |
+| Volume Snapshots | ✓ | ✗ | ✗ | ✓ |
+| CSI Support | ✓ | ✗ | ✓ | ✓ |
+| **Security** | | | | |
+| RBAC | ✓ | ✗ | ✓ | ✓ (Enhanced) |
+| Pod Security | ✓ (PSA) | ✗ | ✓ | ✓ (SCC) |
+| Secret Encryption | ✓ | ✓ | ✓ | ✓ |
+| Image Scanning | ✗ (3rd party) | ✗ | ✗ | ✓ (Built-in) |
+| **Operations** | | | | |
+| Multi-cluster | ✓ | ✗ | ✓ | ✓ |
+| Multi-cloud | ✓ | Limited | ✓ | ✓ |
+| Auto-scaling (HPA) | ✓ | ✗ | ✓ | ✓ |
+| Auto-scaling (VPA) | ✓ | ✗ | ✗ | ✓ |
+| Cluster Autoscaler | ✓ | ✗ | ✓ | ✓ |
+| **Developer Experience** | | | | |
+| Web UI | Dashboard (Basic) | Built-in | Built-in | Console (Excellent) |
+| CLI | kubectl | docker stack | nomad | oc |
+| Helm Support | ✓ | ✓ | ✗ | ✓ |
+| CI/CD Integration | ✓ (Argo, Tekton) | ✓ | ✓ | ✓ (Tekton built-in) |
+| Local Dev | minikube/kind | docker compose | ✓ | CRC |
+
+### Use Case Comparison
+
+```
+เลือก Kubernetes เมื่อ:
+├── ต้องการ Feature ครบที่สุด
+├── Team ขนาดกลาง-ใหญ่ (20+ คน)
+├── Microservices Architecture
+├── ต้องการ Auto-scaling ซับซ้อน
+├── ต้องการ Multi-cluster Management
+└── ต้องการ Community ขนาดใหญ่
+
+เลือก Docker Swarm เมื่อ:
+├── ต้องการเริ่มต้นง่ายที่สุด
+├── Team เล็ก (< 10 คน)
+├── Monolith หรือ Small Microservices
+├── ไม่ต้องการ Complexity ของ K8s
+└── ใช้ Docker อยู่แล้ว
+
+เลือก HashiCorp Nomad เมื่อ:
+├── ต้องการรัน Non-container Workloads ด้วย
+├── ใช้ HashiCorp Stack (Vault, Consul)
+├── ต้องการ Simplicity กว่า K8s แต่ Powerful กว่า Swarm
+├── On-premise หรือ Bare Metal
+└── Mixed Workloads (Windows + Linux)
+
+เลือก OpenShift เมื่อ:
+├── Enterprise ต้องการ Support จาก Red Hat
+├── ต้องการ Security ระดับสูง (DoD, HIPAA)
+├── ต้องการ Developer Experience ที่ดี
+├── ใช้ Red Hat/RHEL อยู่แล้ว
+└── ต้องการ Built-in CI/CD (Tekton)
+```
+
+### Resource Requirements Comparison
+
+```
+Minimum Resources สำหรับ Production Cluster:
+
+Kubernetes:
+├── Control Plane: 3 Nodes × (4 CPU + 8GB RAM)
+├── Worker Nodes: 3+ Nodes × (2 CPU + 4GB RAM)
+└── Total Minimum: ~28 CPU + 44GB RAM
+
+Docker Swarm:
+├── Manager: 3 Nodes × (2 CPU + 4GB RAM)
+├── Worker Nodes: 3+ Nodes × (2 CPU + 2GB RAM)
+└── Total Minimum: ~12 CPU + 18GB RAM
+
+Nomad:
+├── Server: 3 Nodes × (2 CPU + 4GB RAM)
+├── Client Nodes: 3+ Nodes × (2 CPU + 4GB RAM)
+└── Total Minimum: ~12 CPU + 24GB RAM
+
+OpenShift:
+├── Control Plane: 3 Nodes × (4 CPU + 16GB RAM)
+├── Infra Nodes: 3 Nodes × (4 CPU + 16GB RAM)
+├── Worker Nodes: 3+ Nodes × (4 CPU + 16GB RAM)
+└── Total Minimum: ~36 CPU + 144GB RAM (หนักที่สุด!)
+```
+
+---
+
+## Container Orchestration Use Case Matrix
+
+### Matrix: ประเภท Application vs Platform
+
+| ประเภท Application | Docker Swarm | Kubernetes | Nomad | OpenShift | คำแนะนำ |
+|-------------------|--------------|------------|-------|-----------|----------|
+| Static Website | ✓✓✓ | ✓✓ | ✓✓ | ✓✓ | Swarm (ง่ายสุด) |
+| REST API Service | ✓✓ | ✓✓✓ | ✓✓ | ✓✓✓ | K8s (Feature ครบ) |
+| Microservices (10+) | ✓ | ✓✓✓ | ✓✓ | ✓✓✓ | K8s หรือ OpenShift |
+| ML Training Jobs | ✗ | ✓✓✓ | ✓✓ | ✓✓ | K8s (GPU Support) |
+| Batch Processing | ✓ | ✓✓✓ | ✓✓✓ | ✓✓ | K8s หรือ Nomad |
+| Database (StatefulSet) | ✓ | ✓✓✓ | ✓✓ | ✓✓✓ | K8s |
+| Legacy Java App | ✗ | ✓✓ | ✓✓ | ✓✓✓ | OpenShift |
+| Windows Containers | ✗ | ✓✓ | ✓✓✓ | ✓✓ | Nomad หรือ K8s |
+| Edge Computing | ✗ | ✓✓ (k3s) | ✓✓✓ | ✓ (MicroShift) | Nomad หรือ k3s |
+| Multi-cloud | ✗ | ✓✓✓ | ✓✓✓ | ✓✓ | K8s หรือ Nomad |
+
+### Matrix: Company Size vs Platform
+
+```
+Company Size Matrix:
+
+┌────────────────────────────────────────────────────────────────┐
+│           │ Small (< 20) │ Medium (20-100) │ Large (100+)      │
+├───────────┼──────────────┼─────────────────┼───────────────────┤
+│ Startup   │ Docker Swarm │ Kubernetes      │ Kubernetes        │
+│           │ หรือ Compose │ หรือ Swarm      │                   │
+├───────────┼──────────────┼─────────────────┼───────────────────┤
+│ Scaleup   │ Kubernetes   │ Kubernetes      │ Kubernetes        │
+│           │ (ลงทุนเลย)  │                 │ หรือ OpenShift    │
+├───────────┼──────────────┼─────────────────┼───────────────────┤
+│ Enterprise│ OpenShift    │ OpenShift        │ OpenShift         │
+│ (Regulated)│ หรือ K8s   │ หรือ K8s        │ หรือ Multi-K8s    │
+├───────────┼──────────────┼─────────────────┼───────────────────┤
+│ Tech-heavy│ Kubernetes   │ Kubernetes +    │ Custom K8s Stack  │
+│           │              │ Nomad          │ + Service Mesh    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Use Case: E-commerce Platform
+
+```
+ตัวอย่าง E-commerce บน Kubernetes:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    E-commerce on Kubernetes                      │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    Ingress (nginx)                        │  │
+│  └──────────┬──────────────┬──────────────┬─────────────────┘  │
+│             │              │              │                       │
+│         ┌──────┐      ┌──────┐      ┌──────┐                  │
+│         │Web   │      │API   │      │CDN   │                  │
+│         │Frontend    │Gateway      │Edge  │                  │
+│         │(3 pods)    │(5 pods)     │(2 pods)│                │
+│         └──────┘      └──┬───┘      └──────┘                  │
+│                          │                                       │
+│              ┌───────────┼───────────┐                          │
+│              │           │           │                           │
+│          ┌──────┐   ┌──────┐   ┌──────┐                       │
+│          │Product│  │Order │  │User  │                       │
+│          │Service│  │Service│  │Service│                      │
+│          │(3 pods)│ │(5 pods)│ │(3 pods)│                    │
+│          └──────┘   └──┬───┘   └──────┘                       │
+│                        │                                         │
+│              ┌─────────┴─────────┐                              │
+│              │                   │                               │
+│          ┌──────┐          ┌──────────┐                        │
+│          │Payment│          │Notification│                     │
+│          │Service│          │Service    │                      │
+│          │(3 pods)│         │(2 pods)   │                     │
+│          └──────┘          └──────────┘                        │
+│                                                                   │
+│  Databases: MySQL, Redis, MongoDB (StatefulSets)                │
+│  Message Queue: Kafka, RabbitMQ                                  │
+│  Monitoring: Prometheus + Grafana                                │
+└─────────────────────────────────────────────────────────────────┘
+
+HPA Settings:
+- Web Frontend: scale 3-20 pods, CPU > 70%
+- API Gateway: scale 5-50 pods, CPU > 60%
+- Order Service: scale 5-30 pods, RPS > 1000
+- Payment Service: scale 3-15 pods, CPU > 50%
+```
+
+---
+
+## Workshop: เปรียบเทียบ Deploy แบบ Manual vs Orchestrated
+
+### Scenario: Deploy 3-tier Application
+
+เราจะ Deploy Application ที่ประกอบด้วย:
+- Frontend: React App
+- Backend: Node.js API
+- Database: PostgreSQL
+
+### วิธีที่ 1: Manual Deployment (แบบเก่า)
+
+```bash
+# ===== Manual Deployment (ปวดหัวมาก!) =====
+
+# 1. SSH เข้า Server
+ssh user@server1
+
+# 2. Install Dependencies บน Server
+sudo apt-get update
+sudo apt-get install -y nodejs npm postgresql
+
+# 3. Setup Database
+sudo -u postgres psql
+CREATE DATABASE myapp;
+CREATE USER myuser WITH PASSWORD 'secret123';
+GRANT ALL ON DATABASE myapp TO myuser;
+\q
+
+# 4. Deploy Backend
+cd /var/www
+git clone https://github.com/myorg/backend.git
+cd backend
+npm install
+echo "DATABASE_URL=postgres://myuser:secret123@localhost:5432/myapp" > .env
+echo "PORT=3000" >> .env
+pm2 start app.js --name backend
+
+# 5. Deploy Frontend
+cd /var/www
+git clone https://github.com/myorg/frontend.git
+cd frontend
+npm install
+npm run build
+sudo cp -r build/* /var/www/html/
+
+# 6. Configure Nginx (Reverse Proxy)
+sudo cat > /etc/nginx/sites-available/myapp << 'NGINX'
+server {
+    listen 80;
+    server_name myapp.com;
+    
+    location / {
+        root /var/www/html;
+    }
+    
+    location /api {
+        proxy_pass http://localhost:3000;
+    }
+}
+NGINX
+sudo nginx -t && sudo nginx -s reload
+
+# ===== ปัญหาของ Manual Deployment: =====
+# ❌ Server 2 ต้องทำซ้ำทั้งหมด
+# ❌ ถ้า Server ล้มต้องทำเองทุกอย่าง
+# ❌ Scale ต้องทำเอง + Config Load Balancer เอง
+# ❌ Update ต้อง SSH เข้าทุก Server
+# ❌ Rollback ยุ่งยากมาก
+```
+
+### วิธีที่ 2: Docker Compose (ดีขึ้น)
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  frontend:
+    image: myapp-frontend:latest
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+    - "80:80"
+    depends_on:
+    - backend
+    environment:
+    - REACT_APP_API_URL=http://backend:3000
+
+  backend:
+    image: myapp-backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+    - "3000:3000"
+    depends_on:
+    - postgres
+    environment:
+    - DATABASE_URL=postgres://myuser:secret123@postgres:5432/myapp
+      
+  postgres:
+    image: postgres:15-alpine
+    volumes:
+    - postgres-data:/var/lib/postgresql/data
+    environment:
+    - POSTGRES_DB=myapp
+    - POSTGRES_USER=myuser
+    - POSTGRES_PASSWORD=secret123
+
+volumes:
+  postgres-data:
+```
+
+```bash
+# Deploy ด้วย Docker Compose
+docker compose up -d
+
+# ปัญหาของ Docker Compose ใน Production:
+# ❌ รันบน Machine เดียว (Single Point of Failure)
+# ❌ ไม่มี Auto-healing
+# ❌ Scale ต้องทำเอง
+# ❌ Load Balancing ไม่มี Built-in ที่ดี
+```
+
+### วิธีที่ 3: Kubernetes (Production-ready)
+
+```bash
+# สร้าง Namespace
+kubectl create namespace myapp
+
+# สร้าง Secret สำหรับ Database
+kubectl create secret generic db-secret \
+  --from-literal=POSTGRES_DB=myapp \
+  --from-literal=POSTGRES_USER=myuser \
+  --from-literal=POSTGRES_PASSWORD=secret123 \
+  -n myapp
+```
+
+```yaml
+# k8s/postgres.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: myapp
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: myapp
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        envFrom:
+        - secretRef:
+            name: db-secret
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-storage
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: myapp
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None  # Headless Service สำหรับ StatefulSet
+```
+
+```yaml
+# k8s/backend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: myapp
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - name: backend
+        image: myapp-backend:v1.0
+        ports:
+        - containerPort: 3000
+        env:
+        - name: DATABASE_URL
+          value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/$(POSTGRES_DB)"
+        envFrom:
+        - secretRef:
+            name: db-secret
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: myapp
+spec:
+  selector:
+    app: backend
+  ports:
+  - port: 3000
+    targetPort: 3000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: myapp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+```yaml
+# k8s/frontend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: myapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: myapp-frontend:v1.0
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: myapp
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-ingress
+  namespace: myapp
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: myapp.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 80
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: backend
+            port:
+              number: 3000
+```
+
+```bash
+# Deploy ทั้งหมด
+kubectl apply -f k8s/ -n myapp
+
+# ดู Status
+kubectl get all -n myapp
+
+# ===== ประโยชน์ของ Kubernetes: =====
+# ✓ Self-healing: Pod ล้มจะถูกสร้างใหม่อัตโนมัติ
+# ✓ Auto-scaling: HPA scale pods ตาม CPU usage
+# ✓ Rolling Update: Zero-downtime deployment
+# ✓ Rollback: kubectl rollout undo ใน 1 คำสั่ง
+# ✓ Load Balancing: Kubernetes Service กระจาย Traffic
+# ✓ Config Management: ConfigMaps + Secrets
+# ✓ Resource Limits: ควบคุม CPU/Memory ของแต่ละ Pod
+```
+
+### เปรียบเทียบ Deployment Time
+
+```
+Deployment Time Comparison:
+
+Task                      Manual    Docker Compose    Kubernetes
+──────────────────────    ──────    ──────────────    ──────────
+Initial Setup             4-8h      30min             2-4h (ครั้งแรก)
+Deploy New Version        30-60min  5min              2-5min
+Rollback                  1-2h      10min             30sec
+Scale x3                  1-2h      5min              30sec
+Recovery from Failure     30-60min  Manual            Automatic
+Add new Service           4-8h      30min             30min
+```
+
+---
+
+## แบบฝึกหัดพร้อมเฉลย
+
+### ข้อที่ 1: เปรียบเทียบ Container Orchestration
+
+**โจทย์**: ระบุว่าองค์กรต่อไปนี้ควรใช้ Platform ใด พร้อมอธิบายเหตุผล
+
+1. Startup ขายของออนไลน์ ทีม 5 คน ไม่มี DevOps Expert
+2. ธนาคารใหญ่ ต้องการ Compliance สูง มี Red Hat Support
+
+**เฉลย**:
+
+```
+1. Startup ทีม 5 คน:
+   คำตอบ: Docker Swarm หรือ Docker Compose
+   
+   เหตุผล:
+   - ทีมเล็ก ไม่มี Resource ในการเรียน K8s
+   - ต้องการ Deploy เร็ว
+   - Workload ยังไม่ซับซ้อน
+   - สามารถ Migrate ไป K8s ทีหลังได้เมื่อโตขึ้น
+
+2. ธนาคารใหญ่:
+   คำตอบ: Red Hat OpenShift
+   
+   เหตุผล:
+   - Enterprise Support จาก Red Hat
+   - Security Compliance (PCI-DSS, SOC2)
+   - RBAC ที่แข็งแกร่ง
+   - Audit Logging ครบถ้วน
+   - SCC (Security Context Constraints) เข้มกว่า K8s
+```
+
+### ข้อที่ 2: ออกแบบ Architecture
+
+**โจทย์**: ออกแบบ Kubernetes Architecture สำหรับ E-commerce ที่มี:
+- Frontend: React (Stateless)
+- Backend: Node.js API (Stateless)
+- Database: PostgreSQL (Stateful)
+- Cache: Redis (Stateful)
+- Queue: RabbitMQ (Stateful)
+
+**เฉลย**:
+
+```yaml
+# Workload Types ที่ควรใช้:
+
+# 1. Frontend - Deployment (Stateless)
+# เหตุผล: ไม่มี State, Scale ได้อิสระ
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  replicas: 3
+  # HPA สำหรับ Auto-scaling
+
+# 2. Backend API - Deployment (Stateless)
+# เหตุผล: ไม่มี State, Scale ได้อิสระ
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 5
+  # HPA สำหรับ Auto-scaling
+
+# 3. PostgreSQL - StatefulSet
+# เหตุผล: มี State (data), ต้องการ Stable Network Identity
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  replicas: 1  # หรือใช้ Patroni สำหรับ HA
+
+# 4. Redis - StatefulSet
+# เหตุผล: มี State (cache data), Stable Identity สำหรับ Cluster
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  replicas: 3  # Redis Cluster Mode
+
+# 5. RabbitMQ - StatefulSet
+# เหตุผล: มี Message Queue State, ต้องการ Stable Network Identity
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  replicas: 3  # RabbitMQ Cluster
+```
+
+### ข้อที่ 3: Kubernetes vs Docker Swarm Decision
+
+**โจทย์**: Team กำลัง Debate ระหว่าง K8s กับ Swarm สำหรับ New Project:
+- Application: 15 Microservices
+- Team: 15 Engineers, 2 DevOps
+- Traffic: 10,000 requests/minute peak
+- Requirement: Auto-scaling, Zero-downtime deploy
+
+**เฉลย**:
+
+```
+คำตอบ: Kubernetes
+
+เหตุผล:
+1. 15 Microservices → K8s จัดการได้ดีกว่า Swarm มาก
+   - Namespace isolation ระหว่าง Services
+   - Network Policies ระหว่าง Services
+   
+2. Auto-scaling requirement:
+   - K8s: HPA (CPU, Memory, Custom Metrics) + VPA + KEDA
+   - Swarm: ไม่มี Auto-scaling built-in
+   
+3. Zero-downtime deploy:
+   - K8s: Built-in Rolling Update + Readiness Probes
+   - Swarm: Limited Rolling Update
+   
+4. 15 Engineers, 2 DevOps:
+   - K8s Learning Curve สูงกว่า แต่คุ้มค่า
+   - ทีมขนาดนี้รองรับการเรียน K8s ได้
+   
+5. 10,000 req/min peak:
+   - HPA จะ Scale Pod ขึ้นรับ Traffic
+   - Swarm ต้องทำ Manual
+   
+สรุป: ลงทุนเวลาเรียน K8s 1-2 เดือน
+คุ้มค่ากับ Feature และ Scalability ที่ได้
+```
+
+### ข้อที่ 4: แก้ไข Deployment ที่มีปัญหา
+
+**โจทย์**: Deployment นี้มีปัญหาอะไรบ้าง?
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: app
+        image: myapp:latest
+        ports:
+        - containerPort: 8080
+```
+
+**เฉลย**:
+
+```yaml
+# ปัญหาและการแก้ไข:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  labels:           # ← เพิ่ม Labels
+    app: my-app
+spec:
+  replicas: 3       # ← ปัญหา 1: replicas=1 ไม่มี HA
+  selector:         # ← ปัญหา 2: ขาด selector
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:       # ← ปัญหา 3: ขาด Labels บน Pod
+        app: my-app
+    spec:
+      containers:
+      - name: app
+        image: myapp:1.0.0  # ← ปัญหา 4: latest เปลี่ยนแปลงได้ ควรระบุ version
+        ports:
+        - containerPort: 8080
+        resources:          # ← ปัญหา 5: ไม่มี Resource Limits
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:      # ← ปัญหา 6: ไม่มี Health Checks
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+# สรุปปัญหา:
+# 1. replicas=1 → Single Point of Failure
+# 2. ไม่มี selector → Deployment ไม่รู้ว่าจะ Manage Pods ไหน
+# 3. ไม่มี Labels บน Pod Template → Service ไม่พบ Pods
+# 4. image:latest → Deployment ไม่รู้ว่าต้อง Update หรือเปล่า
+# 5. ไม่มี Resource Limits → Pod อาจกิน Resource ไม่จำกัด
+# 6. ไม่มี Health Checks → Traffic ส่งไป Pod ที่ยังไม่พร้อม
+```
+
+---
+
+## สรุป Part 02
+
+ใน Part นี้เราได้เรียนรู้:
+
+1. **ปัญหา "Works on My Machine"** - สาเหตุจาก OS, Runtime, Dependencies, Config ที่แตกต่างกัน
+2. **Container Orchestration แก้ปัญหา** - ทำให้ Environment เหมือนกันทุก Stage
+3. **K8s vs Swarm vs Nomad vs OpenShift** - แต่ละ Platform เหมาะกับ Use Case ต่างกัน
+4. **Use Case Matrix** - เลือก Platform ตาม App Type และ Company Size
+5. **Workshop** - Deploy App แบบ Manual, Compose, และ Kubernetes เปรียบเทียบ
+
+### Checklist ก่อนไปต่อ
+
+- [ ] เข้าใจว่า Container Orchestration แก้ปัญหาอะไร
+- [ ] สามารถเปรียบเทียบ K8s กับ Swarm และ Nomad ได้
+- [ ] เข้าใจเมื่อไรควรใช้ Platform ใด
+- [ ] Deploy 3-tier App บน Kubernetes ได้
+- [ ] ทำแบบฝึกหัดครบ 4 ข้อ
+
+---
+
+*ต่อไป: [Part 03: Docker Fundamentals 1](./part-03-docker-fundamentals-1.md)*

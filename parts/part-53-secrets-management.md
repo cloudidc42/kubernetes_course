@@ -917,3 +917,1151 @@ ETCDCTL_API=3 etcdctl \
 ---
 
 **ต่อไป**: Part 54 - HashiCorp Vault Integration
+
+---
+
+## Sealed Secrets (Bitnami) - ละเอียด
+
+Sealed Secrets แก้ปัญหาหลักของ Kubernetes Secrets: **ไม่สามารถเก็บใน Git ได้อย่างปลอดภัย** Sealed Secrets ใช้ asymmetric cryptography (RSA) ในการเข้ารหัส โดย Controller ที่รันใน cluster เท่านั้นที่ถอดรหัสได้
+
+### สถาปัตยกรรม Sealed Secrets
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    Developer                         │
+│                                                      │
+│  Secret (plaintext) ──► kubeseal ──► SealedSecret   │
+│                            ▲                         │
+│                    (ใช้ public key ของ cluster)      │
+└─────────────────────────────────────────────────────┘
+                              │
+                              ▼ (push to Git)
+┌─────────────────────────────────────────────────────┐
+│                   Git Repository                     │
+│                                                      │
+│  SealedSecret.yaml (encrypted - ปลอดภัยใน Git)     │
+└─────────────────────────────────────────────────────┘
+                              │
+                              ▼ (kubectl apply)
+┌─────────────────────────────────────────────────────┐
+│              Kubernetes Cluster                      │
+│                                                      │
+│  SealedSecret ──► Controller ──► Secret (plaintext) │
+│                   (ใช้ private key ถอดรหัส)          │
+└─────────────────────────────────────────────────────┘
+```
+
+### ติดตั้ง Sealed Secrets Controller
+
+```bash
+# วิธีที่ 1: ใช้ Helm (แนะนำ)
+helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
+helm repo update
+
+helm install sealed-secrets sealed-secrets/sealed-secrets \
+  --namespace kube-system \
+  --set fullnameOverride=sealed-secrets-controller
+
+# วิธีที่ 2: ใช้ manifest โดยตรง
+kubectl apply -f https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/controller.yaml
+
+# ตรวจสอบ installation
+kubectl get pods -n kube-system | grep sealed-secrets
+kubectl get crd sealedsecrets.bitnami.com
+```
+
+### ติดตั้ง kubeseal CLI
+
+```bash
+# macOS
+brew install kubeseal
+
+# Linux
+KUBESEAL_VERSION=$(curl -s https://api.github.com/repos/bitnami-labs/sealed-secrets/tags | jq -r '.[0].name' | cut -c 2-)
+curl -OL "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz"
+tar -xvzf kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz kubeseal
+sudo install -m 755 kubeseal /usr/local/bin/kubeseal
+
+# ตรวจสอบ
+kubeseal --version
+```
+
+### สร้าง SealedSecret - YAML ครบ
+
+```bash
+# Step 1: สร้าง Secret ธรรมดาก่อน (ยังไม่ apply)
+kubectl create secret generic my-app-secret \
+  --from-literal=DB_PASSWORD=supersecret123 \
+  --from-literal=API_KEY=myapikey456 \
+  --from-literal=JWT_SECRET=jwtsecretxyz \
+  --dry-run=client \
+  -o yaml > /tmp/my-secret.yaml
+
+# Step 2: Seal ด้วย kubeseal
+kubeseal \
+  --controller-name=sealed-secrets-controller \
+  --controller-namespace=kube-system \
+  --format yaml \
+  < /tmp/my-secret.yaml \
+  > my-sealed-secret.yaml
+
+# ตอนนี้ my-sealed-secret.yaml ปลอดภัยที่จะ push ไป Git
+```
+
+**ตัวอย่าง SealedSecret ที่ได้:**
+
+```yaml
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: my-app-secret
+  namespace: default
+spec:
+  encryptedData:
+    DB_PASSWORD: AgBy3i4OJSWK+PiTySYZZA9rO43cGDEq...
+    API_KEY: AgAR8JVwBNkJDz5xvAfNqMJfSB...
+    JWT_SECRET: AgBqkMn7tCHw3Kp2...
+  template:
+    metadata:
+      name: my-app-secret
+      namespace: default
+    type: Opaque
+```
+
+### Scope ของ SealedSecret
+
+```bash
+# Scope แบบ strict (default) - ผูกกับ name และ namespace
+kubeseal --scope strict < secret.yaml
+
+# Scope แบบ namespace-wide - เปลี่ยนชื่อ secret ได้ใน namespace เดิม
+kubeseal --scope namespace-wide < secret.yaml
+
+# Scope แบบ cluster-wide - ใช้ได้ทุก namespace
+kubeseal --scope cluster-wide < secret.yaml
+```
+
+### SealedSecret สำหรับ TLS Certificate
+
+```bash
+# สร้าง TLS Secret
+kubectl create secret tls my-tls-secret \
+  --cert=server.crt \
+  --key=server.key \
+  --dry-run=client \
+  -o yaml | \
+kubeseal \
+  --controller-name=sealed-secrets-controller \
+  --controller-namespace=kube-system \
+  --format yaml > my-sealed-tls.yaml
+```
+
+```yaml
+# my-sealed-tls.yaml ที่ได้
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: my-tls-secret
+  namespace: production
+spec:
+  encryptedData:
+    tls.crt: AgBf3Kp8...
+    tls.key: AgCD9xM2...
+  template:
+    metadata:
+      name: my-tls-secret
+      namespace: production
+    type: kubernetes.io/tls
+```
+
+### Rotation ของ Sealed Secrets Key
+
+```bash
+# Sealed Secrets จะ rotate key อัตโนมัติทุก 30 วัน
+# แต่ old keys ยังถูก retain ไว้เพื่อถอดรหัส existing secrets
+
+# ดู keys ที่มีอยู่
+kubectl get secrets -n kube-system \
+  -l sealedsecrets.bitnami.com/sealed-secrets-key \
+  -o name
+
+# Re-seal ด้วย key ใหม่ (แนะนำหลัง key rotation)
+kubeseal --re-encrypt < old-sealed-secret.yaml > new-sealed-secret.yaml
+
+# Fetch public key เพื่อ offline sealing
+kubeseal --fetch-cert \
+  --controller-name=sealed-secrets-controller \
+  --controller-namespace=kube-system \
+  > mycert.pem
+
+# ใช้ cert file สำหรับ offline sealing (ไม่ต้องเชื่อมต่อ cluster)
+kubeseal --cert mycert.pem < secret.yaml > sealed-secret.yaml
+```
+
+### GitOps Workflow ด้วย SealedSecrets
+
+```yaml
+# ไฟล์โครงสร้างใน Git Repository
+kubernetes/
+├── base/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── kustomization.yaml
+├── overlays/
+│   ├── staging/
+│   │   ├── sealed-secret.yaml    # ✅ ปลอดภัยใน Git
+│   │   └── kustomization.yaml
+│   └── production/
+│       ├── sealed-secret.yaml    # ✅ ปลอดภัยใน Git
+│       └── kustomization.yaml
+└── scripts/
+    └── seal-secret.sh
+```
+
+```bash
+#!/bin/bash
+# seal-secret.sh - Script สำหรับสร้าง SealedSecret
+set -euo pipefail
+
+SECRET_NAME=$1
+NAMESPACE=${2:-default}
+ENV_FILE=${3:-.env}
+
+# สร้าง secret จาก env file
+kubectl create secret generic "${SECRET_NAME}" \
+  --from-env-file="${ENV_FILE}" \
+  --namespace="${NAMESPACE}" \
+  --dry-run=client \
+  -o yaml | \
+kubeseal \
+  --controller-name=sealed-secrets-controller \
+  --controller-namespace=kube-system \
+  --namespace="${NAMESPACE}" \
+  --format yaml \
+  > "sealed-${SECRET_NAME}.yaml"
+
+echo "Created: sealed-${SECRET_NAME}.yaml"
+echo "Safe to commit to Git!"
+```
+
+---
+
+## External Secrets Operator - ละเอียด
+
+External Secrets Operator (ESO) เชื่อมต่อ Kubernetes กับ external secret management systems เช่น AWS Secrets Manager, Azure Key Vault, HashiCorp Vault, GCP Secret Manager
+
+### สถาปัตยกรรม External Secrets Operator
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    External Secret Stores                     │
+│                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ AWS Secrets  │  │Azure Key Vault│  │ HashiCorp Vault  │   │
+│  │   Manager    │  │              │  │                  │   │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘   │
+└─────────┼────────────────┼──────────────────┼──────────────┘
+          │                │                  │
+          ▼                ▼                  ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Kubernetes Cluster                         │
+│                                                               │
+│  ExternalSecret ──► ESO Controller ──► Kubernetes Secret    │
+│                                                               │
+│  SecretStore / ClusterSecretStore (กำหนด connection)         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### ติดตั้ง External Secrets Operator
+
+```bash
+# ใช้ Helm
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
+
+helm install external-secrets \
+  external-secrets/external-secrets \
+  --namespace external-secrets \
+  --create-namespace \
+  --set installCRDs=true
+
+# ตรวจสอบ
+kubectl get pods -n external-secrets
+kubectl get crd | grep external-secrets
+```
+
+### AWS Secrets Manager Integration
+
+```yaml
+# Step 1: สร้าง IAM Role สำหรับ ESO (ใช้ IRSA)
+# Trust Policy
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/oidc.eks.REGION.amazonaws.com/id/CLUSTER_ID"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "oidc.eks.REGION.amazonaws.com/id/CLUSTER_ID:sub": "system:serviceaccount:external-secrets:external-secrets"
+      }
+    }
+  }]
+}
+```
+
+```yaml
+# Step 2: สร้าง SecretStore สำหรับ AWS
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-store
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: ap-southeast-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+```
+
+```yaml
+# Step 3: สร้าง ExternalSecret
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: my-app-credentials
+  namespace: production
+spec:
+  refreshInterval: 1h   # sync ทุก 1 ชั่วโมง
+  secretStoreRef:
+    name: aws-secrets-store
+    kind: ClusterSecretStore
+  target:
+    name: my-app-secret    # ชื่อ K8s Secret ที่จะสร้าง
+    creationPolicy: Owner   # ESO เป็นเจ้าของ secret
+    deletionPolicy: Retain  # ไม่ลบ secret เมื่อ ExternalSecret ถูกลบ
+  data:
+  - secretKey: DB_PASSWORD        # key ใน K8s Secret
+    remoteRef:
+      key: production/myapp/database   # ชื่อใน AWS Secrets Manager
+      property: password               # field ใน JSON value
+  - secretKey: API_KEY
+    remoteRef:
+      key: production/myapp/api
+      property: key
+  # ดึงทั้ง secret มาเลย (ถ้า value เป็น JSON object)
+  dataFrom:
+  - extract:
+      key: production/myapp/all-secrets
+```
+
+### Azure Key Vault Integration
+
+```yaml
+# สร้าง Service Principal สำหรับ Azure Key Vault
+az ad sp create-for-rbac \
+  --name "eso-keyvault-sp" \
+  --role "Key Vault Secrets User" \
+  --scopes "/subscriptions/SUB_ID/resourceGroups/RG_NAME/providers/Microsoft.KeyVault/vaults/VAULT_NAME"
+```
+
+```yaml
+# สร้าง Secret สำหรับ Azure credentials ใน K8s
+apiVersion: v1
+kind: Secret
+metadata:
+  name: azure-sp-credentials
+  namespace: external-secrets
+type: Opaque
+stringData:
+  clientId: "your-service-principal-client-id"
+  clientSecret: "your-service-principal-client-secret"
+```
+
+```yaml
+# ClusterSecretStore สำหรับ Azure Key Vault
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: azure-keyvault-store
+spec:
+  provider:
+    azurekv:
+      tenantId: "your-azure-tenant-id"
+      vaultUrl: "https://my-keyvault.vault.azure.net"
+      authType: ServicePrincipal
+      authSecretRef:
+        clientId:
+          name: azure-sp-credentials
+          namespace: external-secrets
+          key: clientId
+        clientSecret:
+          name: azure-sp-credentials
+          namespace: external-secrets
+          key: clientSecret
+```
+
+```yaml
+# ExternalSecret สำหรับ Azure Key Vault
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: azure-app-secrets
+  namespace: production
+spec:
+  refreshInterval: 30m
+  secretStoreRef:
+    name: azure-keyvault-store
+    kind: ClusterSecretStore
+  target:
+    name: app-secrets
+    creationPolicy: Owner
+  data:
+  - secretKey: DATABASE_URL
+    remoteRef:
+      key: database-connection-string  # ชื่อ secret ใน Azure Key Vault
+  - secretKey: SMTP_PASSWORD
+    remoteRef:
+      key: smtp-password
+      version: "2"   # ดึง version เฉพาะ
+  dataFrom:
+  - extract:
+      key: app-config   # ดึง JSON object ทั้งหมด
+```
+
+### GCP Secret Manager Integration
+
+```yaml
+# ClusterSecretStore สำหรับ GCP
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: gcp-secret-store
+spec:
+  provider:
+    gcpsm:
+      projectID: "my-gcp-project"
+      auth:
+        workloadIdentity:
+          clusterLocation: asia-southeast1
+          clusterName: my-cluster
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+```
+
+```yaml
+# ExternalSecret สำหรับ GCP
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: gcp-app-secrets
+  namespace: production
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secret-store
+    kind: ClusterSecretStore
+  target:
+    name: gcp-derived-secret
+  data:
+  - secretKey: API_KEY
+    remoteRef:
+      key: my-api-key
+      version: latest
+```
+
+### PushSecret - ส่ง Secret จาก K8s ไปยัง External Store
+
+```yaml
+# ส่ง K8s Secret ไปเก็บใน AWS Secrets Manager
+apiVersion: external-secrets.io/v1alpha1
+kind: PushSecret
+metadata:
+  name: push-to-aws
+  namespace: default
+spec:
+  refreshInterval: 10s
+  secretStoreRefs:
+  - name: aws-secrets-store
+    kind: ClusterSecretStore
+  selector:
+    secret:
+      name: my-local-secret
+  data:
+  - match:
+      secretKey: DB_PASSWORD
+      remoteRef:
+        remoteKey: production/pushed/db-password
+```
+
+---
+
+## Secret Rotation Strategy
+
+### Automatic Rotation ด้วย External Secrets
+
+```yaml
+# ตั้ง refreshInterval สั้นๆ สำหรับ rotation บ่อย
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: rotating-credentials
+  namespace: production
+spec:
+  refreshInterval: 15m    # ดึง secret ใหม่ทุก 15 นาที
+  secretStoreRef:
+    name: aws-secrets-store
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+    # ใช้ template เพื่อสร้าง connection string
+    template:
+      data:
+        DB_URL: "postgresql://{{ .username }}:{{ .password }}@db-host:5432/mydb"
+  dataFrom:
+  - extract:
+      key: production/db/credentials
+```
+
+### Database Password Rotation ด้วย AWS RDS
+
+```bash
+# ตั้งค่า AWS Secrets Manager สำหรับ auto-rotation
+aws secretsmanager create-secret \
+  --name production/myapp/rds-credentials \
+  --description "RDS credentials with auto-rotation" \
+  --secret-string '{"username":"admin","password":"initial-password"}'
+
+# Enable rotation
+aws secretsmanager rotate-secret \
+  --secret-id production/myapp/rds-credentials \
+  --rotation-lambda-arn arn:aws:lambda:ap-southeast-1:123456789:function:SecretsManagerRotation \
+  --rotation-rules AutomaticallyAfterDays=30
+```
+
+### Secret Rotation สำหรับ Application ที่รันอยู่
+
+```yaml
+# ใช้ Reloader เพื่อ restart deployment เมื่อ secret เปลี่ยน
+# ติดตั้ง Reloader
+helm install reloader stakater/reloader \
+  --namespace default
+
+# Annotate deployment ให้ watch secret
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  annotations:
+    # reload เมื่อ secret นี้เปลี่ยน
+    secret.reloader.stakater.com/reload: "my-app-secret,db-credentials"
+spec:
+  template:
+    spec:
+      containers:
+      - name: my-app
+        envFrom:
+        - secretRef:
+            name: my-app-secret
+```
+
+### Graceful Secret Rotation Strategy
+
+```bash
+# Step 1: สร้าง new secret version
+aws secretsmanager put-secret-value \
+  --secret-id production/myapp/db \
+  --secret-string '{"password":"new-password-v2"}'
+
+# Step 2: อัปเดต ExternalSecret ให้ดึง version ใหม่
+# (หรือรอ refreshInterval)
+kubectl annotate externalsecret rotating-credentials \
+  force-sync="$(date +%s)" \
+  --overwrite
+
+# Step 3: ตรวจสอบว่า secret อัปเดตแล้ว
+kubectl get secret db-credentials -o jsonpath='{.data.DB_PASSWORD}' | base64 -d
+
+# Step 4: ดู rollout status
+kubectl rollout status deployment/my-app
+
+# Step 5: ลบ old secret version (หลังจาก verify แล้ว)
+aws secretsmanager delete-secret-version \
+  --secret-id production/myapp/db \
+  --version-id old-version-id
+```
+
+---
+
+## Encryption at Rest - ละเอียด
+
+### ตรวจสอบสถานะ Encryption ปัจจุบัน
+
+```bash
+# ดู encryption configuration
+kubectl get apiserver -o yaml 2>/dev/null || \
+  cat /etc/kubernetes/manifests/kube-apiserver.yaml | grep encryption
+
+# ตรวจสอบว่า etcd encrypt secrets หรือยัง
+# ต้องรันบน master node
+ETCDCTL_API=3 etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/secrets/default/my-secret | \
+  hexdump -C | head -5
+# ถ้าไม่ encrypted จะเห็น plaintext "k8s" ตอนต้น
+# ถ้า encrypted จะเห็น "k8s:enc:aescbc:v1"
+```
+
+### ตั้งค่า Encryption at Rest ด้วย AES-CBC
+
+```yaml
+# /etc/kubernetes/enc/encryption-config.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+    - secrets
+    - configmaps   # optional: encrypt configmaps ด้วย
+    providers:
+    # Provider แรก = ใช้สำหรับ encrypt ใหม่
+    - aescbc:
+        keys:
+        - name: key1
+          secret: c2VjcmV0LWtleS0zMi1ieXRlcy1sb25nLXN0cmluZw==  # base64 ของ 32-byte key
+    # Identity = อ่าน unencrypted ได้ (สำหรับ migration)
+    - identity: {}
+```
+
+```bash
+# สร้าง encryption key ที่แข็งแกร่ง
+head -c 32 /dev/urandom | base64
+
+# อัปเดต kube-apiserver manifest
+cat >> /etc/kubernetes/manifests/kube-apiserver.yaml << EOF
+    - --encryption-provider-config=/etc/kubernetes/enc/encryption-config.yaml
+EOF
+
+# Mount configuration file
+# เพิ่ม volumeMount และ volume ใน kube-apiserver pod spec
+```
+
+```yaml
+# kube-apiserver.yaml (ส่วนที่ต้องเพิ่ม)
+spec:
+  containers:
+  - command:
+    - kube-apiserver
+    - --encryption-provider-config=/etc/kubernetes/enc/encryption-config.yaml
+    volumeMounts:
+    - name: enc-cfg
+      mountPath: /etc/kubernetes/enc
+      readOnly: true
+  volumes:
+  - name: enc-cfg
+    hostPath:
+      path: /etc/kubernetes/enc
+      type: DirectoryOrCreate
+```
+
+### ตั้งค่า Encryption ด้วย KMS (แนะนำสำหรับ Production)
+
+```yaml
+# ใช้ AWS KMS กับ Kubernetes KMS Plugin
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+    - secrets
+    providers:
+    - kms:
+        name: aws-kms
+        endpoint: unix:///var/run/kmsplugin/socket.sock
+        cachesize: 1000
+        timeout: 3s
+    - identity: {}
+```
+
+```bash
+# ติดตั้ง AWS KMS Plugin
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/aws-encryption-provider/master/deploy/aws-encryption-provider.yaml
+
+# Encrypt existing secrets ที่ยังไม่ได้ encrypt
+kubectl get secrets --all-namespaces -o json | \
+  kubectl replace -f -
+# (ทุก secret จะถูก re-written และ encrypted ด้วย provider แรก)
+```
+
+### Verify Encryption
+
+```bash
+# หลังจากตั้งค่าแล้ว ตรวจสอบ
+ETCDCTL_API=3 etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/secrets/default/my-secret | \
+  strings | head -5
+
+# ควรเห็น: k8s:enc:aescbc:v1:key1:...
+# หรือ: k8s:enc:kms:v1:...
+
+# ตรวจสอบว่า kubectl ยังอ่าน secret ได้
+kubectl get secret my-secret -o jsonpath='{.data.password}' | base64 -d
+```
+
+---
+
+## Workshop: Production Secrets Pipeline
+
+### โจทย์
+สร้าง Secrets Pipeline ที่:
+1. เก็บ secrets ใน AWS Secrets Manager
+2. Sync มายัง Kubernetes ด้วย External Secrets Operator
+3. App ใช้ secrets โดยอัตโนมัติ
+4. เมื่อ rotate secrets app รู้จัก reload
+
+### Step 1: เตรียม AWS Secrets Manager
+
+```bash
+# สร้าง secrets ใน AWS Secrets Manager
+aws secretsmanager create-secret \
+  --name "workshop/myapp/database" \
+  --description "Database credentials for workshop app" \
+  --secret-string '{
+    "host": "postgres.production.svc.cluster.local",
+    "port": "5432",
+    "database": "myapp",
+    "username": "appuser",
+    "password": "SecureP@ssw0rd!",
+    "ssl_mode": "require"
+  }'
+
+aws secretsmanager create-secret \
+  --name "workshop/myapp/api-keys" \
+  --secret-string '{
+    "stripe_key": "sk_live_...",
+    "sendgrid_key": "SG...",
+    "slack_webhook": "https://hooks.slack.com/..."
+  }'
+
+# ตรวจสอบ
+aws secretsmanager list-secrets --query 'SecretList[?starts_with(Name, `workshop/`)]'
+```
+
+### Step 2: ติดตั้ง ESO และตั้งค่า
+
+```bash
+# ติดตั้ง External Secrets Operator
+helm repo add external-secrets https://charts.external-secrets.io
+helm install external-secrets \
+  external-secrets/external-secrets \
+  --namespace external-secrets \
+  --create-namespace
+
+# สร้าง namespace สำหรับ workshop
+kubectl create namespace workshop
+```
+
+```yaml
+# workshop-secret-store.yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: workshop-aws-store
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: ap-southeast-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+```
+
+### Step 3: สร้าง ExternalSecrets
+
+```yaml
+# workshop-external-secrets.yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: workshop-db-secret
+  namespace: workshop
+spec:
+  refreshInterval: 5m
+  secretStoreRef:
+    name: workshop-aws-store
+    kind: ClusterSecretStore
+  target:
+    name: app-database-secret
+    creationPolicy: Owner
+    template:
+      data:
+        DATABASE_URL: "postgresql://{{ .username }}:{{ .password }}@{{ .host }}:{{ .port }}/{{ .database }}?sslmode={{ .ssl_mode }}"
+  dataFrom:
+  - extract:
+      key: workshop/myapp/database
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: workshop-api-keys
+  namespace: workshop
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: workshop-aws-store
+    kind: ClusterSecretStore
+  target:
+    name: app-api-keys-secret
+    creationPolicy: Owner
+  dataFrom:
+  - extract:
+      key: workshop/myapp/api-keys
+```
+
+### Step 4: Deploy Application
+
+```yaml
+# workshop-app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workshop-app
+  namespace: workshop
+  annotations:
+    # Auto-reload เมื่อ secrets เปลี่ยน
+    secret.reloader.stakater.com/reload: "app-database-secret,app-api-keys-secret"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: workshop-app
+  template:
+    metadata:
+      labels:
+        app: workshop-app
+    spec:
+      serviceAccountName: workshop-app-sa
+      containers:
+      - name: app
+        image: nginx:alpine
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-database-secret
+              key: DATABASE_URL
+        envFrom:
+        - secretRef:
+            name: app-api-keys-secret
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 80
+          initialDelaySeconds: 3
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workshop-app-sa
+  namespace: workshop
+automountServiceAccountToken: false
+```
+
+### Step 5: ทดสอบ Secret Rotation
+
+```bash
+# อัปเดต secret ใน AWS Secrets Manager
+aws secretsmanager put-secret-value \
+  --secret-id "workshop/myapp/database" \
+  --secret-string '{
+    "host": "postgres.production.svc.cluster.local",
+    "port": "5432",
+    "database": "myapp",
+    "username": "appuser",
+    "password": "NewSecureP@ssw0rd!2024",
+    "ssl_mode": "require"
+  }'
+
+# Force sync ExternalSecret
+kubectl annotate externalsecret workshop-db-secret \
+  force-sync="$(date +%s)" \
+  --overwrite \
+  -n workshop
+
+# ดู ExternalSecret status
+kubectl get externalsecret -n workshop
+kubectl describe externalsecret workshop-db-secret -n workshop
+
+# ตรวจสอบ secret อัปเดต
+kubectl get secret app-database-secret -n workshop \
+  -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+
+# ดู Deployment restart (Reloader จะ trigger อัตโนมัติ)
+kubectl get pods -n workshop -w
+```
+
+### Step 6: Verification Checklist
+
+```bash
+# 1. ตรวจสอบ ESO ทำงานปกติ
+kubectl get pods -n external-secrets
+kubectl logs -n external-secrets -l app.kubernetes.io/name=external-secrets | tail -20
+
+# 2. ตรวจสอบ SecretStore
+kubectl get clustersecretstore
+kubectl describe clustersecretstore workshop-aws-store
+
+# 3. ตรวจสอบ ExternalSecrets ทั้งหมด
+kubectl get externalsecrets -n workshop
+# ต้องเห็น STATUS: SecretSynced
+
+# 4. ตรวจสอบ secrets ถูกสร้างแล้ว
+kubectl get secrets -n workshop
+
+# 5. ตรวจสอบ app ทำงานได้
+kubectl get pods -n workshop
+kubectl logs -n workshop -l app=workshop-app
+```
+
+---
+
+## แบบฝึกหัด
+
+### แบบฝึกหัดที่ 1: Sealed Secrets
+สร้าง SealedSecret สำหรับ production environment ที่มี:
+- `DB_HOST`: db.production.example.com
+- `DB_PORT`: 5432
+- `DB_NAME`: myproductiondb
+- `DB_USER`: produser
+- `DB_PASS`: MyP@ssw0rd#2024!
+
+แล้ว deploy application ที่ใช้ secrets เหล่านี้
+
+**เฉลย:**
+
+```bash
+# Step 1: สร้าง secret file
+cat > /tmp/prod-db-secret.env << EOF
+DB_HOST=db.production.example.com
+DB_PORT=5432
+DB_NAME=myproductiondb
+DB_USER=produser
+DB_PASS=MyP@ssw0rd#2024!
+EOF
+
+# Step 2: สร้าง K8s Secret (dry-run)
+kubectl create secret generic prod-db-secret \
+  --from-env-file=/tmp/prod-db-secret.env \
+  --namespace=production \
+  --dry-run=client \
+  -o yaml > /tmp/prod-db-secret.yaml
+
+# Step 3: Seal
+kubeseal \
+  --controller-name=sealed-secrets-controller \
+  --controller-namespace=kube-system \
+  --namespace=production \
+  --format yaml \
+  < /tmp/prod-db-secret.yaml \
+  > sealed-prod-db-secret.yaml
+
+# Step 4: Apply
+kubectl create namespace production 2>/dev/null || true
+kubectl apply -f sealed-prod-db-secret.yaml
+
+# Step 5: ตรวจสอบ
+kubectl get sealedsecret -n production
+kubectl get secret prod-db-secret -n production
+```
+
+```yaml
+# Step 6: Deploy app ที่ใช้ secret
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-app
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-app
+  template:
+    metadata:
+      labels:
+        app: db-app
+    spec:
+      containers:
+      - name: db-app
+        image: postgres:15-alpine
+        command: ["psql"]
+        args:
+        - "$(DATABASE_URL)"
+        - "-c"
+        - "SELECT 1"
+        env:
+        - name: DATABASE_URL
+          value: "postgresql://$(DB_USER):$(DB_PASS)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
+        envFrom:
+        - secretRef:
+            name: prod-db-secret
+```
+
+### แบบฝึกหัดที่ 2: External Secrets พร้อม Template
+
+สร้าง ExternalSecret ที่ดึงข้อมูลจาก Vault (หรือ mock ด้วย SecretStore ชนิด Fake) และสร้าง connection string จาก template
+
+```yaml
+# เฉลย: ใช้ Fake SecretStore สำหรับทดสอบ
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: fake-store
+spec:
+  provider:
+    fake:
+      data:
+      - key: "/db/credentials"
+        value: '{"username":"admin","password":"secret123","host":"localhost","port":"5432"}'
+      - key: "/api/keys"
+        value: '{"stripe":"sk_test_xxx","sendgrid":"SG.xxx"}'
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: exercise-secret
+  namespace: default
+spec:
+  refreshInterval: 1m
+  secretStoreRef:
+    name: fake-store
+    kind: ClusterSecretStore
+  target:
+    name: exercise-app-secret
+    template:
+      data:
+        POSTGRES_URL: "postgresql://{{ .username }}:{{ .password }}@{{ .host }}:{{ .port }}/appdb"
+        STRIPE_KEY: "{{ .stripe }}"
+  data:
+  - secretKey: username
+    remoteRef:
+      key: /db/credentials
+      property: username
+  - secretKey: password
+    remoteRef:
+      key: /db/credentials
+      property: password
+  - secretKey: host
+    remoteRef:
+      key: /db/credentials
+      property: host
+  - secretKey: port
+    remoteRef:
+      key: /db/credentials
+      property: port
+  - secretKey: stripe
+    remoteRef:
+      key: /api/keys
+      property: stripe
+```
+
+### แบบฝึกหัดที่ 3: Encryption at Rest Verification
+
+ตรวจสอบว่า cluster ของคุณมี encryption at rest เปิดอยู่หรือไม่
+
+```bash
+# เฉลย:
+# Step 1: สร้าง test secret
+kubectl create secret generic enc-test \
+  --from-literal=key=my-super-secret-value
+
+# Step 2: ตรวจสอบใน etcd (ต้องการ access ไปที่ master node)
+# ถ้าใช้ kind หรือ minikube:
+docker exec -it kind-control-plane bash
+
+ETCDCTL_API=3 etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/secrets/default/enc-test | \
+  strings | grep -E "(my-super|k8s:enc)"
+
+# ถ้าเห็น "my-super-secret-value" = ยังไม่ encrypted!
+# ถ้าเห็น "k8s:enc:aescbc" หรือ "k8s:enc:kms" = encrypted แล้ว!
+
+# Step 3: ล้าง test
+kubectl delete secret enc-test
+```
+
+---
+
+## สรุปเพิ่มเติม
+
+### เปรียบเทียบเครื่องมือจัดการ Secrets
+
+| Feature | Native K8s Secrets | Sealed Secrets | External Secrets |
+|---------|-------------------|----------------|-----------------|
+| เก็บใน Git ได้ | ❌ | ✅ | ✅ (เก็บแค่ reference) |
+| Encryption | Base64 เท่านั้น | RSA asymmetric | ขึ้นกับ backend |
+| Auto-rotation | ❌ | ❌ | ✅ |
+| Central management | ❌ | ❌ | ✅ |
+| ความซับซ้อน | ต่ำ | ปานกลาง | สูง |
+| เหมาะกับ | dev/test | GitOps | enterprise |
+| Multi-cluster | ❌ | ❌ | ✅ |
+
+### Security Checklist สำหรับ Production
+
+```bash
+# 1. ตรวจสอบ encryption at rest
+kubectl get apiserver -o yaml | grep encryption
+
+# 2. ตรวจสอบ RBAC - ไม่มีใครมี wildcard access ไปยัง secrets
+kubectl get clusterrolebindings -o json | \
+  jq '.items[] | select(.roleRef.name == "cluster-admin") | .subjects'
+
+# 3. ตรวจสอบ secrets ที่ไม่ได้ใช้แล้ว
+kubectl get secrets --all-namespaces | grep -v kubernetes.io
+
+# 4. Audit secrets ที่มีขนาดใหญ่ผิดปกติ
+kubectl get secrets --all-namespaces -o json | \
+  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name): \(.data | length) keys"' | \
+  sort -t: -k2 -rn | head -20
+
+# 5. ตรวจสอบ pods ที่ mount secrets ไม่จำเป็น
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | select(.spec.volumes[]?.secret != null) | 
+    .metadata.namespace + "/" + .metadata.name'
+```
+
+**ต่อไป**: Part 54 - HashiCorp Vault Integration (เพิ่มเติม)

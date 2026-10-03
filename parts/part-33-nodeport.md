@@ -842,3 +842,1059 @@ kubectl patch service my-service -p '{"spec":{"type":"ClusterIP"}}'
 
 *ก่อนหน้า: [Part 32 - ClusterIP Service](./part-32-clusterip.md)*
 *ต่อไป: [Part 34 - LoadBalancer Service](./part-34-loadbalancer.md)*
+
+---
+
+## 6. NodePort สำหรับ Development vs Production {#dev-vs-prod}
+
+### 6.1 การใช้ NodePort ใน Development
+
+NodePort เหมาะมากสำหรับ development environment เพราะง่าย รวดเร็ว ไม่ต้องการ external infrastructure
+
+```yaml
+# dev-service.yaml - สำหรับ development
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-dev
+  namespace: development
+  annotations:
+    description: "Development only - DO NOT use in production"
+spec:
+  type: NodePort
+  selector:
+    app: api-server
+    env: development
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    nodePort: 30080    # Fixed port สำหรับง่ายต่อการทดสอบ
+  - name: debug
+    port: 5005
+    targetPort: 5005
+    nodePort: 30005    # Java debug port
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    nodePort: 30090    # Prometheus metrics
+```
+
+```bash
+# Development workflow
+# 1. สร้าง service
+kubectl apply -f dev-service.yaml -n development
+
+# 2. หา Node IP
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+
+# 3. ทดสอบ API
+curl http://$NODE_IP:30080/api/health
+
+# 4. เปิด debug port (Java remote debug)
+# IDE: Connect to $NODE_IP:30005
+
+# 5. ดู metrics
+curl http://$NODE_IP:30090/metrics
+
+# Port-forward ทางเลือก (ไม่ต้องใช้ NodePort)
+kubectl port-forward service/api-service-dev 8080:8080 -n development
+```
+
+### 6.2 ปัญหาของ NodePort ใน Production
+
+```
+❌ ปัญหาที่พบใน Production:
+
+1. Port Range จำกัด (30000-32767)
+   - เพียง 2768 ports สำหรับทั้ง cluster
+   - Services จำนวนมากอาจชน
+
+2. Port ที่ใช้ยากจำ
+   - api.example.com:31234 ไม่ user-friendly
+
+3. ไม่มี SSL/TLS termination
+   - ต้อง handle TLS ใน application เอง
+
+4. Load Balancing ไม่เท่ากัน
+   - Traffic ไปที่ node ใดก็แล้วแต่ DNS resolve
+   - ถ้า node มี pods ไม่เท่ากัน → imbalanced
+
+5. ความปลอดภัย
+   - ทุก port เปิดบนทุก Node
+   - ต้องมี Firewall rules ซับซ้อน
+
+✅ แนะนำสำหรับ Production:
+- LoadBalancer Service
+- Ingress Controller
+- API Gateway
+```
+
+### 6.3 Pattern: NodePort สำหรับ HA Setup
+
+```yaml
+# ha-nodeport.yaml - High Availability setup
+apiVersion: v1
+kind: Service
+metadata:
+  name: ha-web-service
+  annotations:
+    # External LB (เช่น HAProxy/Nginx) ชี้มาที่ NodePorts เหล่านี้
+    external-lb: "haproxy-01.company.com"
+spec:
+  type: NodePort
+  selector:
+    app: web-server
+  ports:
+  - port: 80
+    targetPort: 8080
+    nodePort: 30080
+  - port: 443
+    targetPort: 8443
+    nodePort: 30443
+  externalTrafficPolicy: Local    # ดีกว่าสำหรับ HA
+
+---
+# สร้าง Deployment พร้อม Anti-Affinity
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-server
+  template:
+    metadata:
+      labels:
+        app: web-server
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: web-server
+            topologyKey: "kubernetes.io/hostname"    # 1 pod per node
+      containers:
+      - name: web
+        image: nginx:1.25
+        ports:
+        - containerPort: 8080
+        - containerPort: 8443
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+```
+
+---
+
+## 7. NodePort + External Load Balancer {#nodeport-with-lb}
+
+### 7.1 Architecture: NodePort + HAProxy
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NodePort + External LB                        │
+│                                                                   │
+│  Internet                                                         │
+│      │                                                            │
+│      ▼                                                            │
+│  ┌──────────────────────────────────────┐                        │
+│  │  HAProxy / Nginx (External LB)       │                        │
+│  │  IP: 203.0.113.10 (Public IP)        │                        │
+│  │                                       │                        │
+│  │  frontend myapp                       │                        │
+│  │    bind :80                           │                        │
+│  │    server node1 10.0.0.1:30080 check │                        │
+│  │    server node2 10.0.0.2:30080 check │                        │
+│  │    server node3 10.0.0.3:30080 check │                        │
+│  └──────────────────────────────────────┘                        │
+│              │           │           │                            │
+│              ▼           ▼           ▼                            │
+│  ┌────────┐  ┌────────┐  ┌────────┐                             │
+│  │ Node 1 │  │ Node 2 │  │ Node 3 │                             │
+│  │ :30080 │  │ :30080 │  │ :30080 │                             │
+│  └────────┘  └────────┘  └────────┘                             │
+│       │            │           │                                  │
+│       └────────────┼───────────┘                                 │
+│                    ▼                                              │
+│               Kubernetes Service → Pods                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 HAProxy Configuration
+
+```haproxy
+# /etc/haproxy/haproxy.cfg
+
+global
+    log /dev/log local0
+    chroot /var/lib/haproxy
+    maxconn 50000
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    retries 3
+
+# HTTP frontend
+frontend k8s-http
+    bind *:80
+    default_backend k8s-nodes-http
+    
+    # Health check endpoint
+    acl is_health path /health
+    use_backend health-check if is_health
+
+backend k8s-nodes-http
+    balance roundrobin
+    option httpchk GET /healthz
+    
+    # Kubernetes nodes
+    server node1 10.0.0.1:30080 check inter 2s fall 3 rise 2 weight 100
+    server node2 10.0.0.2:30080 check inter 2s fall 3 rise 2 weight 100
+    server node3 10.0.0.3:30080 check inter 2s fall 3 rise 2 weight 100
+
+# HTTPS frontend
+frontend k8s-https
+    bind *:443 ssl crt /etc/ssl/certs/myapp.pem
+    default_backend k8s-nodes-https
+    http-request set-header X-Forwarded-Proto https
+
+backend k8s-nodes-https
+    balance roundrobin
+    server node1 10.0.0.1:30443 check ssl verify none
+    server node2 10.0.0.2:30443 check ssl verify none
+    server node3 10.0.0.3:30443 check ssl verify none
+
+# Stats page
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 30s
+    stats admin if TRUE
+```
+
+### 7.3 Nginx Configuration
+
+```nginx
+# /etc/nginx/conf.d/k8s-upstream.conf
+
+upstream k8s_nodes {
+    least_conn;                          # Least connections algorithm
+    keepalive 32;                        # Connection pooling
+    
+    server 10.0.0.1:30080 weight=100 max_fails=3 fail_timeout=30s;
+    server 10.0.0.2:30080 weight=100 max_fails=3 fail_timeout=30s;
+    server 10.0.0.3:30080 weight=100 max_fails=3 fail_timeout=30s;
+}
+
+server {
+    listen 80;
+    server_name myapp.example.com;
+    
+    # Redirect to HTTPS
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name myapp.example.com;
+    
+    ssl_certificate /etc/nginx/ssl/myapp.crt;
+    ssl_certificate_key /etc/nginx/ssl/myapp.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    
+    location / {
+        proxy_pass http://k8s_nodes;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Timeouts
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        
+        # Health check
+        proxy_next_upstream error timeout http_500 http_502 http_503;
+    }
+    
+    location /health {
+        access_log off;
+        return 200 "OK";
+    }
+}
+```
+
+### 7.4 Keepalived สำหรับ HA External LB
+
+```
+# /etc/keepalived/keepalived.conf - Virtual IP failover
+
+vrrp_script check_nginx {
+    script "/usr/bin/pgrep nginx"
+    interval 2
+    weight 2
+    rise 2
+    fall 3
+}
+
+vrrp_instance LB_MASTER {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 110             # Master มี priority สูงกว่า
+    advert_int 1
+    
+    authentication {
+        auth_type PASS
+        auth_pass your-secret-password
+    }
+    
+    virtual_ipaddress {
+        203.0.113.10/24      # VIP - ที่ DNS ชี้มา
+    }
+    
+    track_script {
+        check_nginx
+    }
+}
+```
+
+---
+
+## 8. externalTrafficPolicy: Local vs Cluster {#external-traffic-policy}
+
+### 8.1 ความแตกต่างหลัก
+
+```
+externalTrafficPolicy: Cluster (default)
+┌─────────────────────────────────────────────┐
+│                                              │
+│  Client → Node1:30080                        │
+│                │                             │
+│                ▼ (kube-proxy)                │
+│         DNAT + SNAT                          │
+│                │                             │
+│      ┌─────────┴─────────┐                  │
+│      ▼                   ▼                  │
+│   Pod on Node1        Pod on Node2           │
+│   (source IP = NodeIP)                       │
+│                                              │
+│  ข้อดี: load distributed ทุก pods            │
+│  ข้อเสีย: ไม่รู้ client IP จริง              │
+└─────────────────────────────────────────────┘
+
+externalTrafficPolicy: Local
+┌─────────────────────────────────────────────┐
+│                                              │
+│  Client → Node1:30080                        │
+│                │                             │
+│                ▼ (kube-proxy)                │
+│         DNAT only (NO SNAT)                  │
+│                │                             │
+│                ▼                             │
+│         Pod on Node1 ONLY                    │
+│         (source IP = real client IP!)        │
+│                                              │
+│  ข้อดี: รู้ client IP จริง                  │
+│  ข้อเสีย: uneven load distribution          │
+└─────────────────────────────────────────────┘
+```
+
+### 8.2 YAML Configuration
+
+```yaml
+# cluster-policy.yaml - default
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-cluster-policy
+spec:
+  type: NodePort
+  selector:
+    app: web
+  externalTrafficPolicy: Cluster    # default
+  ports:
+  - port: 80
+    targetPort: 8080
+    nodePort: 30080
+
+---
+# local-policy.yaml - preserves client IP
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-local-policy
+spec:
+  type: NodePort
+  selector:
+    app: web
+  externalTrafficPolicy: Local      # ← เปลี่ยนตรงนี้
+  healthCheckNodePort: 32000        # Port สำหรับ health check
+  ports:
+  - port: 80
+    targetPort: 8080
+    nodePort: 30080
+```
+
+### 8.3 ทดสอบ externalTrafficPolicy
+
+```bash
+# สร้าง deployment ที่ log client IP
+kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-ip
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: echo-ip
+  template:
+    metadata:
+      labels:
+        app: echo-ip
+    spec:
+      containers:
+      - name: echo
+        image: k8s.gcr.io/echoserver:1.4
+        ports:
+        - containerPort: 8080
+EOF
+
+# Service Cluster mode
+kubectl expose deployment echo-ip \
+  --type=NodePort \
+  --port=80 \
+  --target-port=8080 \
+  --name=echo-cluster
+
+# Service Local mode
+kubectl expose deployment echo-ip \
+  --type=NodePort \
+  --port=80 \
+  --target-port=8080 \
+  --name=echo-local
+
+kubectl patch service echo-local \
+  -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+
+# หา NodePorts
+CLUSTER_PORT=$(kubectl get service echo-cluster -o jsonpath='{.spec.ports[0].nodePort}')
+LOCAL_PORT=$(kubectl get service echo-local -o jsonpath='{.spec.ports[0].nodePort}')
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+
+echo "Cluster port: $CLUSTER_PORT"
+echo "Local port: $LOCAL_PORT"
+
+# ทดสอบจาก client ภายนอก
+# curl http://$NODE_IP:$CLUSTER_PORT
+# → client_address=10.0.0.1 (Node IP - SNAT'd)
+
+# curl http://$NODE_IP:$LOCAL_PORT
+# → client_address=203.0.113.5 (Real client IP!)
+```
+
+### 8.4 Health Check Node Port
+
+เมื่อใช้ `externalTrafficPolicy: Local` จะมี Health Check Node Port ที่ External LB ใช้ตรวจสอบว่า Node นั้นมี Pod อยู่หรือเปล่า
+
+```yaml
+# service-with-healthcheck.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  type: NodePort
+  selector:
+    app: web
+  externalTrafficPolicy: Local
+  healthCheckNodePort: 31500      # External LB check port นี้
+  ports:
+  - port: 80
+    targetPort: 8080
+    nodePort: 30080
+```
+
+```bash
+# ทดสอบ healthCheckNodePort
+NODE_IP="10.0.0.1"
+HEALTH_PORT=31500
+
+# ถ้า node มี Pod → HTTP 200
+curl http://$NODE_IP:$HEALTH_PORT
+# {"localEndpoints": 1}
+
+# ถ้า node ไม่มี Pod → HTTP 503
+# {"localEndpoints": 0}
+
+# HAProxy ใช้ healthCheckNodePort
+# server node1 10.0.0.1:30080 check port 31500 inter 5s
+```
+
+---
+
+## 9. Security Considerations {#security}
+
+### 9.1 ความเสี่ยงด้านความปลอดภัยของ NodePort
+
+```
+ความเสี่ยงหลัก:
+
+1. Wide Attack Surface
+   - ทุก node เปิด port เดียวกัน
+   - ถ้า 1 node ถูก compromise → attacker ใช้ NodePort เข้า cluster ได้
+
+2. Port Scanning
+   - ง่ายต่อการ scan ports 30000-32767
+   - attacker รู้ว่ามี service อะไรบ้าง
+
+3. DDoS
+   - traffic ตรงมาที่ node IP โดยตรง
+   - ไม่มี Firewall/WAF กรอง
+
+4. No Authentication by Default
+   - ใครก็เข้าถึงได้ถ้ารู้ IP:Port
+```
+
+### 9.2 Firewall Rules สำหรับ NodePort
+
+```bash
+# iptables - อนุญาตเฉพาะ External LB เข้า NodePort
+iptables -I INPUT -p tcp --dport 30080 -s 10.0.0.0/24 -j ACCEPT    # Allow from internal
+iptables -I INPUT -p tcp --dport 30080 -s 203.0.113.10 -j ACCEPT    # Allow from External LB
+iptables -A INPUT -p tcp --dport 30080 -j DROP                       # Block others
+
+# AWS Security Groups
+# Inbound rules:
+# TCP 30000-32767  Source: 10.0.0.0/24 (Internal only)
+# TCP 30000-32767  Source: sg-XXXXXXXX (External LB security group only)
+
+# GCP Firewall Rules
+gcloud compute firewall-rules create k8s-nodeport-internal \
+  --allow tcp:30000-32767 \
+  --source-ranges 10.0.0.0/8 \
+  --target-tags kubernetes-node
+
+# Block external access ยกเว้น LB
+gcloud compute firewall-rules create k8s-nodeport-lb-only \
+  --allow tcp:30000-32767 \
+  --source-tags external-lb \
+  --target-tags kubernetes-node
+```
+
+### 9.3 Network Policy สำหรับ NodePort
+
+```yaml
+# protect-nodeport-service.yaml
+# Note: NetworkPolicy ทำงานที่ Pod level ไม่ใช่ Node level
+# แต่ช่วย restrict traffic หลังจาก เข้ามาใน cluster แล้ว
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-web-traffic
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes:
+  - Ingress
+  ingress:
+  # อนุญาตจาก NodePort (traffic มาจาก node IP)
+  - from:
+    - ipBlock:
+        cidr: 10.0.0.0/24      # Node IP range
+    ports:
+    - protocol: TCP
+      port: 8080
+  # อนุญาตจาก Internal services
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          tier: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+### 9.4 Rate Limiting สำหรับ NodePort
+
+```bash
+# iptables rate limiting
+# จำกัด 100 connections ต่อ minute จาก IP เดียว
+iptables -A INPUT -p tcp --dport 30080 \
+  -m state --state NEW \
+  -m recent --set --name nodeport-ratelimit
+
+iptables -A INPUT -p tcp --dport 30080 \
+  -m state --state NEW \
+  -m recent --update --seconds 60 --hitcount 100 \
+  --name nodeport-ratelimit \
+  -j DROP
+
+# หรือใช้ hashlimit module
+iptables -A INPUT -p tcp --dport 30080 \
+  -m hashlimit \
+  --hashlimit-mode srcip \
+  --hashlimit-upto 100/min \
+  --hashlimit-burst 200 \
+  --hashlimit-name nodeport-limit \
+  -j ACCEPT
+
+iptables -A INPUT -p tcp --dport 30080 -j DROP
+```
+
+---
+
+## 10. Workshop: Expose Multiple Services {#workshop}
+
+### Workshop Overview
+
+ในเวิร์กช็อปนี้ จะสร้าง microservices หลายตัวและ expose ผ่าน NodePort พร้อมตั้งค่า External Load Balancer จำลอง
+
+### Step 1: สร้าง Application Stack
+
+```bash
+# สร้าง namespace
+kubectl create namespace workshop
+
+# สร้าง backend API
+kubectl apply -n workshop -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+      tier: backend
+  template:
+    metadata:
+      labels:
+        app: api
+        tier: backend
+    spec:
+      containers:
+      - name: api
+        image: hashicorp/http-echo
+        args:
+        - -text
+        - '{"service":"api","version":"1.0","pod":"$(HOSTNAME)"}'
+        env:
+        - name: HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+      tier: frontend
+  template:
+    metadata:
+      labels:
+        app: web
+        tier: frontend
+    spec:
+      containers:
+      - name: web
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-panel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admin
+      tier: admin
+  template:
+    metadata:
+      labels:
+        app: admin
+        tier: admin
+    spec:
+      containers:
+      - name: admin
+        image: hashicorp/http-echo
+        args:
+        - -text
+        - '{"service":"admin","access":"restricted"}'
+        ports:
+        - containerPort: 5678
+EOF
+
+# รอทุก pod ready
+kubectl wait --for=condition=Ready pods --all -n workshop --timeout=120s
+```
+
+### Step 2: สร้าง NodePort Services
+
+```bash
+kubectl apply -n workshop -f - <<'EOF'
+# API Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  annotations:
+    purpose: "REST API endpoint"
+spec:
+  type: NodePort
+  selector:
+    app: api
+    tier: backend
+  externalTrafficPolicy: Local
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 5678
+    nodePort: 30180
+---
+# Web Frontend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+  annotations:
+    purpose: "Web frontend"
+spec:
+  type: NodePort
+  selector:
+    app: web
+    tier: frontend
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    nodePort: 30181
+---
+# Admin Panel - restricted
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-service
+  annotations:
+    purpose: "Admin panel - internal only"
+spec:
+  type: NodePort
+  selector:
+    app: admin
+    tier: admin
+  externalTrafficPolicy: Cluster
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 5678
+    nodePort: 30182
+EOF
+```
+
+### Step 3: ทดสอบ Services
+
+```bash
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+
+echo "=== Testing API Service (port 30180) ==="
+curl http://$NODE_IP:30180
+
+echo "=== Testing Web Service (port 30181) ==="
+curl -s http://$NODE_IP:30181 | head -5
+
+echo "=== Testing Admin Service (port 30182) ==="
+curl http://$NODE_IP:30182
+
+# ทดสอบ load balancing
+echo "=== Load Balancing Test ==="
+for i in $(seq 1 5); do
+  curl -s http://$NODE_IP:30180
+  echo
+done
+
+# ดู services ทั้งหมด
+kubectl get services -n workshop -o wide
+```
+
+### Step 4: Network Policy - Restrict Admin
+
+```bash
+kubectl apply -n workshop -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-admin
+spec:
+  podSelector:
+    matchLabels:
+      tier: admin
+  policyTypes:
+  - Ingress
+  ingress:
+  # อนุญาตเฉพาะจาก nodes ภายใน
+  - from:
+    - ipBlock:
+        cidr: 10.0.0.0/8    # Internal network only
+    ports:
+    - protocol: TCP
+      port: 5678
+EOF
+
+# ทดสอบว่า NetworkPolicy ทำงาน
+kubectl run test-client --rm -it -n workshop --image=curlimages/curl \
+  --restart=Never -- curl -s --max-time 5 admin-service.workshop.svc.cluster.local:8080
+```
+
+### Step 5: Monitoring NodePort Usage
+
+```bash
+# ดู connection counts
+kubectl exec -n workshop $(kubectl get pod -n workshop -l app=api -o jsonpath='{.items[0].metadata.name}') \
+  -- netstat -an | grep :5678 | wc -l
+
+# ดู service endpoints
+kubectl get endpoints -n workshop
+
+# ดู traffic distribution
+for service in api-service web-service admin-service; do
+  echo "=== $service ==="
+  kubectl get endpoints $service -n workshop -o jsonpath='{.subsets[*].addresses[*].ip}'
+  echo
+done
+
+# iptables rules สำหรับ NodePort
+NODEPORT=30180
+iptables -t nat -L KUBE-NODEPORTS -n | grep $NODEPORT
+```
+
+### Step 6: Cleanup
+
+```bash
+kubectl delete namespace workshop
+```
+
+---
+
+## 11. แบบฝึกหัด NodePort {#exercises}
+
+### แบบฝึกหัดที่ 1: เปรียบเทียบ externalTrafficPolicy
+
+```bash
+# สร้าง environment
+kubectl create namespace traffic-policy-test
+
+# สร้าง deployment ที่ log client IP
+kubectl apply -n traffic-policy-test -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ip-echo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ip-echo
+  template:
+    metadata:
+      labels:
+        app: ip-echo
+    spec:
+      containers:
+      - name: echo
+        image: k8s.gcr.io/echoserver:1.4
+        ports:
+        - containerPort: 8080
+EOF
+
+# สร้าง 2 services
+kubectl expose deployment ip-echo -n traffic-policy-test \
+  --type=NodePort --port=80 --target-port=8080 \
+  --name=echo-cluster-policy
+
+kubectl expose deployment ip-echo -n traffic-policy-test \
+  --type=NodePort --port=80 --target-port=8080 \
+  --name=echo-local-policy
+
+kubectl patch service echo-local-policy -n traffic-policy-test \
+  -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+
+# รอ pods
+kubectl wait --for=condition=Ready pods --all -n traffic-policy-test --timeout=60s
+
+# ดู NodePorts
+kubectl get services -n traffic-policy-test
+
+# ทดสอบจาก Node เอง
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+CLUSTER_PORT=$(kubectl get svc echo-cluster-policy -n traffic-policy-test -o jsonpath='{.spec.ports[0].nodePort}')
+LOCAL_PORT=$(kubectl get svc echo-local-policy -n traffic-policy-test -o jsonpath='{.spec.ports[0].nodePort}')
+
+echo "Cluster policy response:"
+curl -s http://$NODE_IP:$CLUSTER_PORT | grep client_address
+
+echo "Local policy response:"
+curl -s http://$NODE_IP:$LOCAL_PORT | grep client_address
+
+# สังเกต: client_address ต่างกัน!
+# Cluster: node IP (SNAT)
+# Local: real client IP
+
+# Cleanup
+kubectl delete namespace traffic-policy-test
+```
+
+---
+
+### แบบฝึกหัดที่ 2: ค้นหาและแก้ไข NodePort ที่ชน
+
+```bash
+# สร้างสถานการณ์ที่ port ซ้ำกัน
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-a
+spec:
+  type: NodePort
+  selector:
+    app: dummy
+  ports:
+  - port: 80
+    nodePort: 30300
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-b
+spec:
+  type: NodePort
+  selector:
+    app: dummy
+  ports:
+  - port: 80
+    nodePort: 30300    # ← ชนกับ service-a!
+EOF
+# คาดว่าจะ error: The Service "service-b" is invalid: spec.ports[0].nodePort: Invalid value
+
+# สำรวจ NodePorts ที่ใช้งานอยู่
+kubectl get services --all-namespaces -o go-template='
+{{range .items}}
+{{if eq .spec.type "NodePort"}}
+{{.metadata.namespace}}/{{.metadata.name}}:
+{{range .spec.ports}}  {{.nodePort}} ({{.name}})
+{{end}}
+{{end}}
+{{end}}'
+
+# หา NodePort ที่ว่าง
+python3 -c "
+used_ports = {30300}  # ports ที่ใช้แล้ว
+all_ports = set(range(30000, 32768))
+available = sorted(all_ports - used_ports)
+print('Available ports (first 10):', available[:10])
+"
+
+# Cleanup
+kubectl delete service service-a service-b 2>/dev/null || true
+```
+
+---
+
+## 12. เฉลยแบบฝึกหัด {#answers}
+
+### เฉลยแบบฝึกหัดที่ 1
+
+```
+ผลที่คาดหวัง:
+
+Cluster policy client_address:
+client_address=10.0.0.1  ← Node IP (source NAT'd)
+
+Local policy client_address:
+client_address=YOUR_MACHINE_IP  ← Real client IP!
+
+เหตุผล:
+- Cluster mode: kube-proxy ทำ SNAT เพื่อ load balance ไปทุก pods
+  Source IP ถูกแทนที่ด้วย Node IP
+  
+- Local mode: kube-proxy ไม่ทำ SNAT
+  Source IP ถูก preserve ไว้
+  แต่ traffic ไปได้เฉพาะ Pods บน Node ที่รับ request
+
+เมื่อไหรควรใช้อะไร:
+- Local: Web servers ที่ต้องรู้ client IP (geo-blocking, rate limiting by IP)
+- Cluster: Services ที่ต้องการ load distribution เท่ากัน
+```
+
+### เฉลยแบบฝึกหัดที่ 2
+
+```
+ผลที่คาดหวัง:
+
+Error เมื่อสร้าง service-b:
+The Service "service-b" is invalid: 
+  spec.ports[0].nodePort: Invalid value: 30300: 
+  provided port is already allocated
+
+วิธีแก้:
+1. ใช้ port อื่นที่ไม่ซ้ำ
+2. ปล่อยให้ Kubernetes auto-assign (ไม่ระบุ nodePort)
+3. ใช้ kubectl get services --all-namespaces ตรวจสอบก่อน
+
+เครื่องมือตรวจสอบ:
+kubectl get services --all-namespaces \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}: {range .spec.ports[*]}{.nodePort} {end}{"\n"}{end}' \
+  | grep -v "^.*: $"
+```
+
+---
+
+## แหล่งข้อมูลเพิ่มเติม
+
+- [Kubernetes NodePort Documentation](https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport)
+- [externalTrafficPolicy](https://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip)
+- [HAProxy Documentation](https://www.haproxy.org/download/2.8/doc/configuration.txt)
+- [Nginx Upstream Configuration](https://nginx.org/en/docs/http/ngx_http_upstream_module.html)
+- [iptables Rate Limiting](https://www.netfilter.org/documentation/HOWTO/packet-filtering-HOWTO.html)
+
+---
+
+*ก่อนหน้า: [Part 32 - ClusterIP Service](./part-32-clusterip.md)*
+*ต่อไป: [Part 34 - LoadBalancer Service](./part-34-loadbalancer.md)*
